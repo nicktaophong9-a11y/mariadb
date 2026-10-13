@@ -575,6 +575,138 @@ here.
 * **`my_real_read()`'s out-of-order path**, **`handle_password_errors()`** and
   **`vio/viossl.c`** — see §4.10.
 
+### 4.13 The charset conversion tier, verified rather than assumed
+
+Earlier passes dismissed this tier with "`copy_and_convert()` is bounded by
+`MY_MIN(to_length, from_length)`". That was too shallow in two ways, and one of
+them was an outright gap.
+
+**The gap: the client picks *both* ends of the conversion.**
+`thd_init_client_charset()` ends with
+
+```c
+    thd->org_charset= cs;
+    thd->update_charset(cs, cs, cs);
+```
+
+so the single collation-id byte at offset 8 of the handshake response sets
+`character_set_client`, `collation_connection` **and**
+`character_set_results`. The earlier audit only ever treated the destination as
+`system_charset_info` (utf8mb3). But `net_send_error_packet()` does
+
+```c
+  convert_error_message(converted_err, sizeof(converted_err),
+                        thd->variables.character_set_results,
+                        err, strlen(err), system_charset_info, &error);
+```
+
+into a 512-byte stack buffer, and `convert_error_message()` writes through
+`to_cs->cset->wc_to_printable` — a function pointer that was never looked at —
+with `to_cs` chosen by the client. So the destination encoder of every
+pre-auth error message is attacker-selected, and the whole encoder tier had to
+be audited, not just utf8mb3's.
+
+**The reachable charset set**, read off the running server rather than guessed:
+`is_supported_parser_charset()` is `mbminlen == 1 && number != 17`, which
+excludes ucs2/utf16/utf32 (and the filename charset). What survives with a
+collation id below 256 is utf8mb4 (maxlen 4), utf8mb3 / ujis / eucjpms (3),
+big5 / cp932 / euckr / gb2312 / gbk / sjis (2), and about 25 single-byte
+charsets. **gb18030 is not compiled into the official image** — a direct query
+of `information_schema.COLLATIONS` returns no rows for it — which removes the
+historically most bug-prone decoder from scope.
+
+**Generic engines.** `my_convert()`, `my_convert_using_func()`,
+`my_convert_fix()`, `my_copy_fix_mb()` and
+`my_append_fix_badly_formed_tail()` do not bound anything themselves: each
+delegates the destination limit to `wc_mb(to_cs, wc, to, to_end)` and stops as
+soon as it returns `MY_CS_TOOSMALL*`, or checks `to + chlen > to_end` directly.
+`my_convert()`'s split between the ASCII fast path and the slow path keeps the
+sum within the original `to_length` (`to_length -= copied_length` before the
+hand-off). `my_copy_fix_mb()` bounds its `memmove` by
+`MY_MIN(src_length, dst_length)` and passes the hard `dst + dst_length` to the
+tail fixer. So the entire tier's safety rests on the per-charset handlers.
+
+**The `well_formed_char_length` template** (`ctype-mb.inl`) advances `b` only by
+a positive `CHARLEN()` result and `CHARLEN()` returns `MY_CS_TOOSMALL` once
+`b >= e`, so `status->m_source_end_pos <= e` always. That is what *proves*
+`Well_formed_prefix(...).length()` can only shrink, and therefore that
+`user[user_len]= '\0'` after the leading-quote chop stays inside
+`user_buff[USERNAME_LENGTH + 1]`.
+
+**The printable-escape path.** `my_wc_to_printable_generic`, `_8bit` and
+`_sjis` all funnel into `my_wc_to_printable_ex()`, which reserves
+`my_printable_length(bslen, diglen)` = `bslen + (MY_CS_PRINTABLE_CHAR_LENGTH - 1) * diglen`
+before escaping. The obvious way for this to be wrong would be an escape whose
+length depends on the magnitude of `wc` while the reservation is constant — it
+is not: `to_printable_8bit()` emits the prefix plus **all four** nibbles and
+returns `MY_CS_PRINTABLE_CHAR_LENGTH` (5) unconditionally. `_sjis` passes
+`bslen = 2`, reserving 6 for 5 written, because U+005C encodes as the two bytes
+`81 5F` in sjis. The non-ASCII branch (ucs2/utf16/utf32) is unreachable pre-auth
+anyway because `mbminlen > 1`.
+
+**Decoders (`mb_wc`), all ten.** `my_mb_wc_utf8mb3_quick`,
+`my_mb_wc_utf8mb4_quick`, `my_mb_wc_euc_jp`, `my_mb_wc_eucjpms`,
+`my_mb_wc_big5`, `my_mb_wc_cp932`, `my_mb_wc_euc_kr`, `my_mb_wc_gb2312`,
+`my_mb_wc_gbk`, `my_mb_wc_sjis`: every one checks `s >= e` first and
+`s + N > e` before dereferencing `s[1..N-1]`, and the negative "valid sequence
+without a Unicode mapping" return (`-2`, `-3`) is only produced after the
+corresponding bytes were confirmed available — which matters because
+`my_convert_using_func()` advances `from += (-cnvres)` on that return. The utf8
+decoders return only positive lengths, and reject overlong forms (`c < 0xc2`)
+and out-of-range lead bytes (`c < 0xf5`).
+
+**Encoders (`wc_mb`), all ten.** `my_uni_utf8mb3` checks `r >= e`, `r + 2 > e`,
+`r + 3 > e` on its three branches and returns `MY_CS_ILUNI` for
+`wc >= 0x10000`; that last point is what caps expansion at three bytes per
+character and so *validates* `THD::copy_fix()`'s `dstcs->mbmaxlen * src_length`
+sizing. `my_wc_mb_utf8mb4` computes `count` from the magnitude and then checks
+`r + count > e` before writing. `my_wc_mb_8bit`, `my_wc_mb_euc_jp`,
+`my_wc_mb_eucjpms`, `my_wc_mb_big5`, `my_wc_mb_cp932`, `my_wc_mb_euc_kr`,
+`my_wc_mb_gb2312`, `my_wc_mb_gbk`, `my_wc_mb_sjis` each check the end before
+every write. The EUC-JP/eucjpms/sjis/cp932 encoders guard `wc > 0xFFFF` before
+indexing their `unicode_to_*` tables.
+
+**Tables.** This is where an index driven straight by client bytes could land
+out of bounds, so it was checked mechanically rather than by eye
+(`verify_charset_tables.py`):
+
+* the six directly indexed tables — `jisx0208_eucjp_to_unicode`,
+  `jisx0212_eucjp_to_unicode` and the two eucjpms equivalents,
+  `unicode_to_sjis`, `unicode_to_cp932` — are each declared `[65536]`, which
+  covers the full domain the guards allow: `(hi << 8) + s[1]` reaches 0xFFFF,
+  and the encoders cap `wc` at 0xFFFF;
+* the 49 range-guarded tables behind `func_big5_uni_onechar`,
+  `func_gbk_uni_onechar`, `func_ksc5601_uni_onechar`,
+  `func_gb2312_uni_onechar` and their `func_uni_*_onechar` inverses were all
+  parsed out of the sources and their real initializer entry counts compared
+  against `HIGH - LOW + 1`, with the subtracted offset checked against the
+  guard's `LOW`. **All 49 match exactly; zero problems.**
+
+**Empirically** (`poc_deep_targeted.py`, groups A/B/D against the ASAN build):
+23 database-field lengths of non-printable bytes from 1 to 65535, chosen to land
+on the 509/510/511/512 boundaries of `err_buffer` and on the four-byte escape
+boundary, all return `ER_INVALID_CHARACTER_STRING` — i.e. they really do drive
+`err_conv()` → `set_strq()` → `convert_error_message()` →
+`net_send_error_packet()` — with no sanitizer report. Usernames of 127..512
+bytes, bare and quoted, each ending in a deliberately truncated multi-byte
+sequence, across eleven charsets: clean. And a sweep of **all 256 collation
+ids** against ten adversarial byte sequences in both the username and the
+database field: clean.
+
+### 4.14 Correction: a packet of exactly 0xFFFFFF is a multi-packet marker
+
+Worth recording because it invalidated one of the targeted tests. A single
+handshake-response packet whose length is exactly `MAX_PACKET_LENGTH`
+(0xFFFFFF) does not get parsed on its own: `my_net_read_packet_reallen()` treats
+`len == MAX_PACKET_LENGTH` as "first fragment of a multi-packet" and blocks
+waiting for a continuation, so the connection just stalls. The legal way to
+deliver a 16 MB payload pre-auth is `0xFFFFFF` followed by a zero-length
+packet, and that is also the only combination `net_realloc()` permits against
+the 16 MB `max_allowed_packet` (any non-zero continuation makes
+`helping = len + where_b` reach `max_packet_size` and is refused). Sending it
+that way returns `ER_ACCESS_DENIED_ERROR`, which confirms the ~48 MB
+`THD::copy_fix()` allocation of §4.9 really does execute and complete.
+
 ## 5. What an auth bypass would actually buy on this target
 
 Worth knowing before spending effort on one, since a bypass to `root@%`
@@ -616,6 +748,16 @@ Done:
   host matching, the error-formatting path (`err_conv`, `net_send_error_packet`)
   and the host-error accounting ✔
 * ASAN build of 13.0.2 and targeted PoCs for §4.2 and §4.3 ✔
+* the charset conversion tier verified end to end (§4.13): ten decoders, ten
+  encoders, five generic engines, the printable-escape arithmetic, and all 55
+  conversion tables checked mechanically against the index ranges their guards
+  allow ✔
+* targeted stress of the arithmetic that had only been checked on paper
+  (`poc_deep_targeted.py`) ✔ — `err_conv`/`net_send_error_packet` at every
+  buffer boundary, the username boundary across eleven charsets bare and
+  quoted with truncated multi-byte tails, the `net_realloc` and 16 MB
+  multi-packet shapes random fuzzing never produced, and a sweep of all 256
+  collation ids. No sanitizer report.
 * 46,500 randomised pre-auth cases against the ASAN build ✔ — capability-flag
   combinations, charset ids, username/database/plugin-name shapes, all three
   auth-response length encodings, malformed connection-attribute blobs,
@@ -623,7 +765,7 @@ Done:
   above `net_buffer_length`, TLS-upgraded connections, desynchronised sequence
   numbers and PROXY-protocol signatures. No sanitizer report, no crash.
 
-Remaining ideas, in order of expected value:
+What is still outstanding, in order of expected value:
 * **In-process fuzzing.** Network fuzzing caps out around 50 cases/second, which
   is far too slow for this parser. The leverage is a harness that drives
   `parse_client_handshake_packet()` directly — there is no in-tree libFuzzer
@@ -650,6 +792,13 @@ Remaining ideas, in order of expected value:
   shorter than 32 bytes.
 * `poc_next_field_boundary.py` — §4.3: packet lengths aligned to the allocator's
   4096-byte rounding, with the database field running to the final byte.
+* `poc_deep_targeted.py` — §4.13/§4.14: four groups aimed at specific
+  arithmetic rather than at random coverage — the error-formatting buffers at
+  their exact boundaries, the username boundary across charsets, the
+  `net_realloc` and multi-packet shapes, and every collation id.
+* `verify_charset_tables.py` — static, no server needed: parses every
+  range-guarded conversion-table lookup out of the charset sources and compares
+  the table's real initializer length against the range its guard admits.
 
 ### Reproducing
 
