@@ -2435,6 +2435,77 @@ model; and make the `MY_CS_READY` publish a release store with an acquire load
 on the fast path, which is what the double-checked pattern needs to be correct
 anywhere.
 
+### 4.35 Is there an upstream fix the target has not got? No — and that cuts both ways
+
+13.0.2 is a very new major version, so the cheapest remaining avenue was not to
+audit more code but to let upstream do it: **any pre-auth bug fixed after
+13.0.2 is a live bug on a target pinned to 13.0.2.** The session's repository is
+a MariaDB fork whose `main` is at `Merge 13.1 to main`, dated the same day as
+this work, with `mariadb-13.0.2` an ancestor and 592 commits after it — so this
+is a comparison against trunk, not a stale snapshot.
+
+70 of those commits touch files in the pre-auth set. Filtering to non-merges
+leaves work on the DENY/privilege feature (MDEV-41343, MDEV-40656), JSON
+functions, binlog, and `CREATE OR REPLACE` — nothing on the handshake. Three
+looked promising by title and were checked:
+
+* `cleanup: remove buggy str2int, replace with a template` — `strings/str2int.c`,
+  which `narrow.py` had scanned; not on the pre-auth path.
+* `MDEV-35738 mariadb build -fsanitize=pointer-compare` — no change to any
+  pre-auth file.
+* `MDEV-40146 vio_gencert function doesn't set serial number` — the
+  auto-generated TLS certificate of §4.4, but a correctness fix, not memory
+  safety.
+
+Then the files themselves, which is the part that settles it. **Zero diff
+between `mariadb-13.0.2` and `origin/main`:**
+
+```
+sql/sql_connect.cc  sql/sql_error.cc  sql/protocol.cc  sql/net_serv.cc
+sql-common/pack.c   mysys/charset.c   strings/ctype.c  strings/ctype-simple.c
+vio/viossl.c        vio/viosocket.c   sql/hostname.cc
+```
+
+`sql/sql_acl.cc` does change — 2,301 insertions — but every hunk is in the ACL
+*table* classes and role handling, not the handshake. Extracting the pre-auth
+functions from both revisions and comparing them directly:
+
+```
+IDENTICAL: parse_client_handshake_packet  server_mpvio_read_packet
+           server_mpvio_write_packet      native_password_authenticate
+           do_auth_once                   find_mpvio_user
+           send_server_handshake_packet    send_plugin_request_packet
+           login_failed_error             set_user_salt_if_needed
+           get_auth_plugin                acl_check_ssl
+           is_connector_net_client        check_require_secured_transport
+           check_connection               login_connection
+           thd_init_client_charset        thd_prepare_connection
+           do_handle_one_connection       prepare_new_connection_state
+           thd_set_peer_addr              CONNECT::create_thd
+```
+
+`acl_authenticate` is the single exception, and the whole of its diff is:
+
+```c
+-              (longlong) sctx->master_access, mpvio.db.str));
++              (longlong) sctx->master_access.allow_bits(), mpvio.db.str));
+```
+
+inside a `DBUG_PRINT` — a no-op in the release build the target runs, and a
+consequence of the privilege-bitmask type change, not a fix.
+
+So the avenue is closed: **upstream has not fixed anything in the pre-auth path
+since 13.0.2**, and there is no patch gap to exploit on this target.
+
+The same comparison says something more useful in the other direction, though.
+§4.25's four over-read branches live in `sql_acl.cc`'s
+`parse_client_handshake_packet` and `sql-common/pack.c`; §4.27's missing
+32-byte re-check lives in the same function; §4.34's publish-before-fill lives
+in `strings/ctype-simple.c` and `mysys/charset.c`. Every one of those is
+byte-identical in today's trunk. **They are not rediscoveries of fixed bugs —
+they are live in current upstream MariaDB**, which is worth knowing before
+reporting them, and is the strongest argument for doing so.
+
 ## 5. What an auth bypass would actually buy on this target
 
 Worth knowing before spending effort on one, since a bypass to `root@%`
