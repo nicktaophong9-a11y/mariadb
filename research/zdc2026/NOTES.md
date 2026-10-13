@@ -842,6 +842,167 @@ reports and zero crashes. Given §4.11 — a pre-auth `memcpy` whose only bound
 *is* a `DBUG_ASSERT` — this was the single most likely way to surface another
 bug of that class, and it found none in the paths that are reachable here.
 
+### 4.16 Lazy collation initialisation is pre-auth reachable, and its publish is a data race
+
+This one was found by the coverage differential rather than by reading code,
+which is the argument for doing the measurement. Comparing the functions
+executed with pre-auth traffic against those executed by a bare server
+start/stop put `my_coll_parser_scan_rule`, `my_coll_rules_realloc`,
+`my_coll_rule_expand`, `my_uca_generate_page`, `my_char_weight_put`,
+`my_uca_copy_page`, `create_fromuni`, `my_cset_init_8bit`,
+`my_8bit_charset_flags_from_data` and `my_coll_init_8bit_bin` in the
+pre-auth-only set. Those are the charset and collation *builders*: they run the
+first time a collation is used, not at startup.
+
+`thd_init_client_charset()` calls `get_charset(net->read_pos[8])` with the
+collation-id byte out of the handshake response, so **an unauthenticated client
+decides which collation gets built and when**. Nothing in the earlier scope
+analysis had noticed that.
+
+`get_internal_charset()` publishes the result with double-checked locking
+(`mysys/charset.c`):
+
+```c
+    if (cs->state & MY_CS_READY)   /* read with no mutex held */
+    {
+      my_collation_statistics_inc_use_count(cs_number);
+      return cs;
+    }
+    mysql_mutex_lock(&THR_LOCK_charset);
+    ...
+        if (my_ci_init_charset(cs, loader) || my_ci_init_collation(cs, loader))
+          cs= NULL;
+        else
+          cs->state|= MY_CS_READY;   /* published last, still under the mutex */
+    mysql_mutex_unlock(&THR_LOCK_charset);
+```
+
+`cs->state` is a plain `uint` — not atomic, not volatile, with no
+release/acquire pairing — so this is a data race by the language rules: a thread
+on the fast path can in principle observe `MY_CS_READY` without observing the
+weight pages and handler pointers the initialising thread wrote. That matters
+because several weight lookups deliberately rely on pages being non-NULL ("By
+adding these dummy pages we can avoid testing 'page' against NULL",
+`ctype-utf8.c`). The neighbouring `my_collation_statistics_inc_use_count()` race
+is *documented* as intentional and harmless; this one is not.
+
+**Tested** (`poc_collation_race.py`): on a freshly started server, for each of
+collation ids 1..255, 24 connections pre-connect, pre-build their packets, and
+release on a barrier so their `get_charset()` calls land together — 6,120
+barrier-synchronised racing connections in total, each then asked to decode
+non-ASCII and truncated multi-byte sequences in both the username and the
+database field. Every connection got its reply, the server stayed up, and ASAN
+reported nothing.
+
+That matches the reasoning: the initialisation itself is inside the mutex, the
+flag store is the last thing before the unlock, and on x86-64 the store-store
+ordering plus the non-inlined `my_ci_init_*` calls acting as compiler barriers
+make the publish effectively ordered in practice. So this is a real
+standard-level race and a hardening issue worth reporting, not an exploitable
+one here. It also means the collation builders themselves are exercised for all
+256 ids without a memory error.
+
+### 4.17 Every memory write in the pre-auth call graph, enumerated
+
+Spot-checking writes is how a write primitive gets missed, so they were
+enumerated mechanically instead: for each function in the pre-auth call graph,
+every call to `memcpy`, `memmove`, `memset`, `bzero`, `strcpy`, `strncpy`,
+`strcat`, `strmov`, `strnmov`, `strmake`, `strmake_buf`, `sprintf`,
+`snprintf`/`my_snprintf`/`my_vsnprintf`, `strfill`, `int2store`/`int3store`/
+`int4store`/`int8store`, `memdup`, `strdup`, `my_strndup`, `safe_strcpy` and
+`strnxmov` was extracted and checked individually. **38 call sites.**
+
+All but one were already covered by §4.6/§4.10/§4.12/§4.13. The exception was
+`server_mpvio_read_packet`'s
+
+```c
+  strmake_buf(ai->authenticated_as, mpvio->acl_user->user.str);
+```
+
+`authenticated_as` is `char[MYSQL_USERNAME_LENGTH + 1]` = 513, `strmake_buf(D,S)`
+expands to `strmake(type_assert_buf(D), S, sizeof(D) - 1)` so the bound is 512
+and `type_assert_buf` even rejects a pointer where an array is expected, and the
+source is an ACL username capped at `USERNAME_LENGTH` = 384. Bounded with
+margin.
+
+Combined with §4.5's conclusion about dangling pointers — `mpvio->db`,
+`sctx->user` and `cached_server_packet.pkt` are all independent copies
+(`copy_with_error`, `my_strndup`, `thd->memdup`), and the one pointer that does
+alias `net->buff` across a `my_net_read()` is reassigned right after it —
+**there is no write primitive in the reachable pre-auth path on this target.**
+That is the central negative result: a memory-corruption RCE needs a write, and
+every write here is bounded by a correct size computation.
+
+### 4.18 Concurrency, measured
+
+Everything before this was single-connection. `preauth_concurrent.py` runs 32
+threads of mixed pre-auth shapes — half of them hammering one ACL row with a
+fixed username to maximise contention in `find_mpvio_user()` and
+`set_user_salt_if_needed()`, half spreading the hash across every row — with
+TLS upgrades, deliberately failed TLS handshakes, desynchronised sequence
+numbers, auth-switch replies above `net_buffer_length`, and oversized
+multi-packets mixed in. **233,624 rounds over 600 s, no sanitizer report, no
+crash.**
+
+RSS was sampled throughout as an independent leak check, since a per-connection
+allocation into a *global* root (rather than the THD mem_root, which is released
+with the connection) would show up as monotonic growth. It did not: the samples
+oscillate — 371 MB, 950 MB, 724 MB, 834 MB above baseline — so memory is being
+reclaimed. The peak is consistent with §4.9's per-connection amplification
+(32 concurrent connections each able to hold a ~48 MB conversion buffer), which
+is a resource-exhaustion vector bounded by `max_connections`, not a leak.
+
+Two related leads were closed by reading rather than guessing:
+
+* **The host cache is completely dead at `host_cache_size=0`**, not merely
+  bypassed. `hash_filo::add()` begins `if (!m_size) return 1;`, so nothing is
+  ever inserted and `search()` always returns NULL — there is no LRU churn to
+  race on. `inc_host_errors()` therefore reduces to the one `memcpy` of §4.11.
+* **No `acl_memroot` growth per connection.** `set_user_salt_if_needed()`
+  returns early when `auth_copy->salt.str` is set, and for an account with an
+  empty `auth_string` — `mariadb.sys` on this target — `safe_lexcstrdup_root()`
+  returns a static `""` rather than allocating, so `salt.str` is non-NULL from
+  ACL load onwards and the early return always fires.
+
+### 4.19 In-process fuzzing, and a fidelity bug in the test rig it exposed
+
+Network fuzzing is bounded by connection setup. §4.15 showed coverage was
+already near-complete, so the missing dimension was inputs per covered branch,
+not coverage. The instrumented build therefore carries an **env-gated,
+discovery-only** hook (`MARIADB_PREAUTH_FUZZ_HOOK` at build time,
+`MARIADB_FUZZ_HANDSHAKE=N` at run time) that re-parses each connection's first
+handshake packet N times over mutated copies of itself, against the real THD,
+NET and ACL state. It restores `thd->client_capabilities`, `mpvio->acl_user`,
+`mpvio->curr_auth`, `mpvio->status` and `cached_client_reply` between
+iterations, preserves the NUL terminator the network layer guarantees at
+`read_pos[len]`, and clears `CLIENT_SSL` and `CLIENT_PLUGIN_AUTH` from every
+mutated packet because those two branches would do blocking network I/O from
+inside the loop (both are covered over the network instead, §4.15). Anything it
+finds has to reproduce over the network against an unmodified binary.
+
+The hook was verified to actually be running rather than assumed: 100 seed
+packets take **140 ms with it off and 1031 ms with it on at N=5000**, i.e. about
+1.8 µs per extra parse. A first campaign of 2,000 seeds × 5,000 iterations =
+**10,000,000 parses** produced no sanitizer report.
+
+Building this also exposed a **fidelity bug in the test rig**, which is worth
+recording because it had been inflating the measured surface. The
+coverage-differential set contained `acl_check_ssl`, `set_privs_on_login`,
+`acl_find_proxy_user`, `check_password_lifetime`, `mysql_change_db`,
+`init_for_queries`, `do_command`, `change_user`, `send_ok` and `net_send_ok` —
+all post-authentication. The reason: `mariadb-install-db
+--auth-root-authentication-method=normal` creates `root@127.0.0.1`,
+`root@::1` and `root@<hostname>` **with no password**, and the fuzzers connect
+from 127.0.0.1, so any case that happened to send user `root` with an empty
+auth response simply logged in. The official entrypoint drops exactly those
+accounts (`DROP USER IF EXISTS root@'127.0.0.1', root@'::1'` plus the hostname
+one) and sets a password on `root@localhost`. Both instrumented servers have now
+been aligned to the official account set — demo@%, healthcheck@{127.0.0.1,::1,
+localhost}, mariadb.sys@localhost, root@%, root@localhost — so later runs are
+pre-auth only. The earlier negative results are unaffected (a successful login
+only adds code paths), but the measured "pre-auth" surface was too generous and
+is corrected here.
+
 ## 5. What an auth bypass would actually buy on this target
 
 Worth knowing before spending effort on one, since a bypass to `root@%`
@@ -863,7 +1024,10 @@ primitive, or memory corruption that gets there directly.
 ## 6. Status
 
 **No unauthenticated RCE found. No write primitive reachable pre-auth, and no
-authentication bypass.** Specifically:
+authentication bypass.** The central result is §4.17: every one of the 38
+memory-writing call sites in the pre-auth call graph was enumerated and checked
+individually, and all are bounded by a correct size computation — so there is no
+write primitive for a memory-corruption RCE to use. Specifically:
 
 * every out-of-bounds access found (§4.2, §4.3) is a *read* that provably stays
   inside the `net->buff` allocation on this target;
@@ -893,6 +1057,17 @@ Done:
   quoted with truncated multi-byte tails, the `net_realloc` and 16 MB
   multi-packet shapes random fuzzing never produced, and a sweep of all 256
   collation ids. No sanitizer report.
+* all 38 memory writes in the pre-auth call graph enumerated and individually
+  bounded (§4.17) ✔
+* the pre-auth surface *measured* rather than listed by hand, by coverage
+  differential (§4.16, §4.19) ✔ — which found the lazy collation builders that
+  the hand-written scope had missed, and a fidelity bug in the test rig
+* concurrency (§4.18) ✔ — 233,624 rounds over 32 threads, with RSS sampling as
+  an independent leak check; no sanitizer report, no monotonic growth
+* the lazy collation-initialisation race (§4.16) ✔ — 6,120 barrier-synchronised
+  connections across all 256 collation ids on a freshly started server
+* in-process fuzzing (§4.19) ✔ — hook verified live by A/B timing (140 ms vs
+  1031 ms per 100 seeds), 10,000,000 mutated parses with no sanitizer report
 * the whole battery re-run against a Debug+ASAN+gcov build with `DBUG_ASSERT`
   live, and the result *measured* rather than asserted (§4.15) ✔ —
   `parse_client_handshake_packet` at 96.05% of its lines,
@@ -945,6 +1120,12 @@ What is still outstanding, in order of expected value:
 * `poc_coverage_gaps.py` — §4.15: the two branches measured coverage showed were
   never reached, a rejected TLS handshake and a multi-packet that exceeds
   `max_allowed_packet`.
+* `preauth_concurrent.py` — §4.18: many-threaded pre-auth stress against the
+  shared ACL/TLS/counter state, with RSS sampling for leak detection.
+* `poc_collation_race.py` — §4.16: barrier-synchronised bursts that race the
+  first use of each collation id, which is what an unauthenticated client picks.
+* `drive_inprocess_fuzz.py` — §4.19: seed supplier for the in-process re-parse
+  hook; keeps every packet inside the hook's size window so it always engages.
 
 ### Reproducing
 
