@@ -2239,7 +2239,10 @@ the protocol path.
 #### Every race, triaged
 
 16 threads of mixed pre-auth traffic, 13,113 rounds: **39 reports.** Grouped by
-the memory they touch, which is what decides whether any of them is a primitive:
+the memory they touch, which is what decides whether any of them is a primitive
+(a longer campaign followed — 6 rounds of 32 threads × 600 s plus the collation
+race, about **250,000 pre-auth rounds and 328 reports** — and it added the one
+site that is not a counter: §4.34):
 
 | location | reports | what it is |
 |---|---|---|
@@ -2252,8 +2255,13 @@ the memory they touch, which is what decides whether any of them is a primitive:
 | `global_status_var` (2,160 B) | 1 | status counters |
 | **`my_charset_euckr_korean_ci` (200 B)** | 1 | a `CHARSET_INFO` struct — §4.16 |
 
-**Not one race is on a pointer or a buffer.** Everything is a counter, the
-global RNG, or InnoDB's own AIO bookkeeping. There is no write primitive here.
+**In this run, not one race is on a pointer or a buffer** — everything is a
+counter, the global RNG, or InnoDB's own AIO bookkeeping. The longer campaign
+changed that: it found an 8-byte write racing an 8-byte read on
+`cs->tab_from_uni`, both ends pre-auth and attacker-driven (§4.34). Still not a
+write primitive — the race is on a pointer being *published*, and what a reader
+could do with a half-built table is read — but it is the one report here that is
+not bookkeeping.
 
 The `my_rnd` races are deliberate, and the code says so:
 
@@ -2305,6 +2313,127 @@ store to the struct with it, or does not and takes the mutex.
 
 So the concurrency line is closed the same way the others were: mechanically,
 and negative.
+
+### 4.34 The charset table is published before it is filled — benign on x86-64, not on ARM
+
+The longer TSAN campaign (6 rounds of 32 threads × 600 s plus the collation
+race) surfaced sites the 13,113-round run had not, and one of them is not a
+counter. 30 reports in `my_wc_mb_8bit`, with both sides pre-auth and both
+attacker-driven:
+
+```
+  Read of size 8 by thread T15:                      /* no mutex */
+    #0 my_wc_mb_8bit                 strings/ctype-simple.c:347
+    #1 my_wc_to_printable_ex          strings/ctype.c:1077
+    #2 my_wc_to_printable_8bit        strings/ctype.c:1125
+    #3 my_convert_using_func          strings/ctype.c:1198
+    #4 convert_error_message          sql/sql_error.cc:1016
+    #5 Protocol::net_send_error_packet sql/protocol.cc:445
+    #7 Protocol::end_statement        sql/protocol.cc:593
+    #8 login_connection               sql/sql_connect.cc:1253
+
+  Previous write of size 8 by thread T80 (mutexes: write M0):
+    #0 create_fromuni                 strings/ctype-simple.c:1458
+    #1 my_cset_init_8bit              strings/ctype-simple.c:1547
+    #2 my_ci_init_charset             include/m_ctype.h:1296
+    #3 get_internal_charset           mysys/charset.c:908
+    #5 thd_init_client_charset(THD*, unsigned int)  sql/sql_connect.cc:865
+    #6 parse_client_handshake_packet   sql/sql_acl.cc:14612
+```
+
+So one connection's **collation id byte** drives the charset initialisation
+while another connection's **pre-auth error message** is being converted for the
+wire. An 8-byte write against an 8-byte read: a pointer, not a statistic.
+
+#### The order is publish-then-fill
+
+```c
+  /* Allocate and fill reverse table for each plane */
+  n=i;
+  if (!(cs->tab_from_uni= (MY_UNI_IDX *)
+                          (loader->once_alloc)(sizeof(MY_UNI_IDX) * (n + 1))))
+    return TRUE;                                        /* pointer published */
+
+  for (i=0; i< n; i++)
+    ((struct my_uni_idx_st*)cs->tab_from_uni)[i]= idx[i].uidx;   /* entries after */
+
+  /* Set end-of-list marker */
+  bzero((char*) &cs->tab_from_uni[i],sizeof(MY_UNI_IDX));        /* terminator last */
+```
+
+and the reader walks it with no bound but that terminator, then indexes through
+whatever it finds:
+
+```c
+  for (idx=cs->tab_from_uni; idx->tab ; idx++)
+  {
+    if (idx->from <= wc && idx->to >= wc)
+    {
+      str[0]= idx->tab[wc - idx->from];
+```
+
+`my_once_alloc()` is a bump pointer over plain `malloc()` blocks and does **not**
+zero, so entries between the publish and the fill hold pool contents. A reader
+that saw the pointer but not the fills would therefore walk past the (not yet
+written) terminator and evaluate `idx->tab[wc - idx->from]` on an uninitialised
+`idx->tab` with an uninitialised `idx->from` — and `wc` is the codepoint from
+the attacker's own username, being converted for the error packet. `str[0]` goes
+into that packet. That is a one-byte read at a semi-controlled address, echoed
+back to the attacker.
+
+#### Why it does not happen on this target
+
+`get_internal_charset()` hands out a `cs` only two ways:
+
+```c
+    if (cs->state & MY_CS_READY)       /* unsynchronised fast path */
+    { my_collation_statistics_inc_use_count(cs_number); return cs; }
+    mysql_mutex_lock(&THR_LOCK_charset);
+    ... my_ci_init_charset(cs, loader) ...  /* create_fromuni runs here */
+    cs->state|= MY_CS_READY;                /* set last */
+    mysql_mutex_unlock(&THR_LOCK_charset);
+```
+
+`MY_CS_READY` is stored *after* `create_fromuni` has finished, and the slow path
+holds the mutex. On x86-64, stores are not reordered with other stores, so any
+thread that observes `MY_CS_READY` also observes every preceding store —
+`tab_from_uni`, the entries, the terminator. A reader therefore cannot obtain a
+half-built table, and the official target is x86-64 (the pinned digest is the
+amd64 manifest, §1). TSAN flags the pair because there is no happens-before
+edge, not because the values can be inconsistent here.
+
+#### Why that is luck rather than correctness
+
+The fast-path load of `cs->state` is a plain load, and the publish is a plain
+store; the mutex's release edge only orders things for a thread that *acquires*
+the same mutex, which the fast path never does. On a weakly-ordered
+architecture — aarch64, ppc64, both of which MariaDB ships — the reader can
+observe `MY_CS_READY` while the stores that preceded it are still invisible, and
+then everything in the paragraph above happens for real: an unauthenticated
+attacker opens one connection choosing a collation whose charset has not been
+initialised yet, another connection that provokes a pre-auth error with a
+username needing conversion, and races them.
+
+So this is an x86-only reprieve on an architecture-dependent bug, which is worth
+an upstream report even though it is not an entry here. It is also materially
+worse than §4.16's framing, which identified the same unsynchronised publish but
+only on `cs->state`, a `uint` — the table pointer and its contents are the part
+that matters.
+
+The same publish-then-fill shape appears twice more, both reached through the
+same lazy init: `init_state_maps()` (`mysys/charset.c:66`) publishes
+`cs->state_map` and derives `cs->ident_map` from it before either half is
+filled, and `ctype-uca.c:34803` publishes `cs->uca` before populating it. Their
+readers are the SQL lexer and the UCA collation routines, which pre-auth are
+reached with `system_charset_info` rather than an attacker-chosen charset, so
+they are weaker; `create_fromuni` is the one with both ends under attacker
+control.
+
+Fix, in increasing order of thoroughness: fill the array through a local and
+assign `cs->tab_from_uni` last, so there is no window regardless of memory
+model; and make the `MY_CS_READY` publish a release store with an acquire load
+on the fast path, which is what the double-checked pattern needs to be correct
+anywhere.
 
 ## 5. What an auth bypass would actually buy on this target
 
@@ -2503,7 +2632,7 @@ Done:
   recycled every 30,000 connections. No sanitizer report.
 * the pre-auth memory question settled at byte level (§4.20) ✔ — and the
   weaker RSS-based claim in §4.18 withdrawn
-* concurrency closed mechanically, not by reasoning (§4.33) ✔ — the one avenue
+* concurrency closed mechanically, not by reasoning (§4.33, §4.34) ✔ — the one avenue
   left that could still produce a *write*, since a pre-auth race in which two
   threads write the same memory is a primitive neither §4.17 nor §4.22 would
   see. MariaDB 13.0.2 does not build usable under GCC's TSAN (an instrumented
@@ -2512,7 +2641,13 @@ Done:
   over 13,113 pre-auth rounds, and **not one on a pointer or a buffer** — all
   counters, the deliberately-unlocked global RNG, or InnoDB's AIO bookkeeping.
   §4.16's charset race is confirmed empirically, on `CHARSET_INFO::state`, a
-  `uint`
+  `uint`. The longer campaign (≈250,000 pre-auth rounds, 328 reports) then found
+  §4.34, the one report that is not bookkeeping: `create_fromuni()` publishes
+  `cs->tab_from_uni` before filling it and writes the end-of-list marker last,
+  while `my_wc_mb_8bit()` walks that array from another connection's pre-auth
+  error-message conversion with no mutex. Benign on x86-64 because
+  `MY_CS_READY` is stored last and stores are not reordered there — and not
+  benign on aarch64 or ppc64, where MariaDB also ships
 * out-of-bounds reads attacked directly (§4.24–§4.27) ✔ — the research build
   poisons the unused tail of `net->buff`, which is what made §4.2/§4.3-shaped
   over-reads visible at all: they land inside a valid 16 KB allocation, so
@@ -2542,10 +2677,12 @@ Known limits of these results, stated rather than left implicit:
   sites), but the release build's devirtualisation was not separately checked.
 
 What is still outstanding, in order of expected value:
-* **Longer TSAN exposure.** 13,113 rounds is a start, not a sweep; a rarer race
-  on something other than a counter is the one shape that would still change the
-  conclusion. A 6-round campaign of 32 threads × 600 s plus the collation race
-  is running.
+* **An aarch64 or ppc64 run.** §4.34 is safe on this target only because of
+  x86-64's store ordering; on a weakly-ordered build the same pre-auth race
+  yields a wild read with an attacker-influenced index whose result is echoed
+  into the error packet. The competition target is x86-64, so this is an
+  upstream report rather than an entry, but it is the one finding here whose
+  severity depends on a property of the machine rather than of the code.
 * **Can the memory after `net->buff` be groomed?** This is what separates
   §4.25 from a remote crash. The 8-byte slack is unreachable through the
   protocol, so it would have to be heap layout: a freed block of the same size
