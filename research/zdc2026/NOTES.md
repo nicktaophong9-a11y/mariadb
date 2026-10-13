@@ -1243,6 +1243,279 @@ Correction to my own note: the line clearing `CLIENT_SSL` out of the packet at
 read it out of the modified tree and briefly took it for upstream code. MariaDB's
 guard is the `packets_read` monotonicity above.
 
+### 4.24 Making out-of-packet reads visible, and what that does to §4.3
+
+The one memory-safety class the two enumerations do not close is the
+out-of-bounds *read*, and §4.2 and §4.3 are exactly that: reads that leave the
+packet body but stay inside the `net->buff` allocation. That is precisely why
+ASAN cannot see them — the slack between the end of the packet and
+`net->buff_end` is addressable memory, so an over-read lands in valid heap and
+nothing complains. The argument that they are harmless was mine, from reading
+the code; nothing was checking it.
+
+So the research build now poisons that slack. For the duration of each
+re-parse the hook calls
+
+```c
+  uchar *from= net->read_pos + len + 1;   /* +1: the terminator my_net_read sets */
+  from= (uchar*) (((uintptr_t) from + 7) & ~(uintptr_t) 7);
+  if (net->buff_end > from)
+    __asan_poison_memory_region(from, (size_t) (net->buff_end - from));
+```
+
+and unpoisons before its own `memcpy` and on the way out. The start is rounded
+up because ASAN poisons whole 8-byte granules, so the detector is accurate to
+within 8 bytes of the packet end rather than exactly at it — it under-reports,
+never over-reports.
+
+This is only safe *inside the hook*. The hook clears `CLIENT_SSL` and
+`CLIENT_PLUGIN_AUTH` out of every mutated packet, so the parser performs no
+network I/O; poisoning around the **network** parse would false-positive,
+because `my_net_init()` sets `net->buff = net->write_pos` and
+`net->read_pos = net->buff` — one buffer for both directions — so the two
+nested `my_net_read()` calls inside `parse_client_handshake_packet()`
+(`sql_acl.cc:14490` post-TLS, `:14722` auth-switch) and the four write sites in
+`sql_acl.cc` all land in the poisoned slack legitimately. Extending it to the
+network path means unpoisoning at each of those six sites; not done yet.
+
+**The detector fires on the first run**, which is the point of building it:
+
+```
+==3868==ERROR: AddressSanitizer: use-after-poison on address 0x5290000f0228
+READ of size 2 at 0x5290000f0228 thread T13
+    #0 strlen
+    #1 parse_client_handshake_packet  sql_acl.cc:14567
+    ...
+0x5290000f0228 is located 40 bytes inside of 16424-byte region
+  =>0x5290000f0200: 00 00 00 00 00[f7]f7 f7 f7 f7 f7 f7 ...
+```
+
+`sql_acl.cc:14567` is `passwd_len= strlen(passwd);` in the
+`!CLIENT_SECURE_CONNECTION` branch — **§4.3**. So §4.3 is no longer a reading
+of the code: it has a sanitizer stack trace behind it, reached from an ordinary
+pre-auth packet. The shadow bytes read exactly as designed: five addressable
+granules, then poison, and the scan one byte past the boundary.
+
+Because that known read halts the server on the first mutated packet that
+reaches it, the hook now also sets `CLIENT_SECURE_CONNECTION` back on, so the
+poisoned campaign can explore the rest of the parser instead of stopping on
+something already written up. The branch itself is still fuzzed over the
+network, where the poisoning is not in effect.
+
+#### §4.3 is bounded by an invariant, not by luck
+
+With the read demonstrated, its original dismissal deserved a harder look.
+§4.3 said "not triggerable" because the slack is `my_malloc`'d and a fresh
+mapping reads back as zeros, so the scan stops immediately. That argument is
+about the allocator, and an attacker who can put non-zero bytes in the slack
+would break it. There is a path to try: `parse_client_handshake_packet()` runs
+once per connection, but its `CLIENT_SSL` branch reads a **second** packet into
+the same buffer, so a large pre-TLS packet followed by a small post-TLS one
+leaves the first packet's bytes in the tail the scan then walks. Only the
+capability words are parsed before `sslaccept()`, so the rest of that first
+packet is free padding.
+
+`poc_slack_scan.py` does this — the large packet *is* the SSLRequest, which is
+what `Conn.start_tls(request=...)` was added for — and sweeps pre-TLS padding
+from 0 to 65536 against usernames that run to the final byte so that `passwd`
+lands past the terminator. It also runs the stronger form: one connection fills
+a buffer and drops it, and the next connection's `my_net_init()` may be handed
+the same freed chunk, so the tail is the previous connection's data rather than
+a fresh mapping.
+
+**40 padding cases and 125 fill/scan pairs: every one returns `err1043`, the
+server stays up, and there is no ASAN report.** The reason is an invariant
+rather than the allocator: `my_net_read()` always writes a terminating zero at
+`read_pos[pkt_len]`, so *every* region of the buffer that has ever held
+incoming data ends in a zero, at a position no higher than
+`net->buff + net->max_packet` — inside the allocation. The scan therefore stops
+at the most recent terminator wherever it starts. Pre-auth there is no way to
+write a large region with no trailing zero: the write side shares the buffer
+but everything it emits pre-auth is small (the greeting, an auth-switch
+request, an error packet capped at 520 bytes by §4.13), and a packet large
+enough to reach the end of the buffer triggers `net_realloc` into a fresh
+allocation whose tail is untouched.
+
+That is a materially better argument than the one §4.3 shipped with, and it
+does not depend on the allocator. One honest caveat in the other direction:
+ASAN quarantines freed chunks, so the fill-then-scan phase is weaker evidence
+on this build than it would be against stock glibc — but the invariant does
+not care which allocator is underneath.
+
+### 4.25 A pre-auth out-of-bounds read that leaves the heap block — one root cause, three branches
+
+This is the first memory-safety defect found here that actually crosses an
+allocation boundary, and it is reached from a single unauthenticated packet on
+3306. It is **not** an RCE, and the reasons are set out at the end; it is
+recorded because it is a real bug with a one-line fix, and because it corrects
+§4.3.
+
+#### The root cause
+
+```c
+  char *passwd= strend(user)+1;                      /* sql_acl.cc:14547 */
+```
+
+`my_net_read()` guarantees a terminating zero at `read_pos[pkt_len]`. When the
+username fills the packet to its final byte and carries no NUL of its own,
+`strend(user)` stops on *that* terminator, so `passwd == read_pos + pkt_len + 1`
+— one byte outside the packet. Nothing checks `passwd` before the three
+branches that consume it, and the comment above the second one asserts the
+opposite:
+
+```c
+  else if (!(thd->client_capabilities & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA))
+  {
+    /* Packet buffer is null-terminated by the network layer, so strend(user)
+       stays within bounds and passwd remains within the packet. */
+    passwd_len= (uchar)(*passwd++);                  /* :14575 */
+  }
+```
+
+#### The three branches read different distances past the buffer
+
+`net_allocate_new_packet()` and `net_realloc()` both allocate
+`max_packet + NET_HEADER_SIZE + COMP_HEADER_SIZE + 1`, i.e. `max_packet + 8`,
+and set `buff_end = buff + max_packet`. So there are exactly **8 bytes** of
+slack past `buff_end`, and a packet of exactly `max_packet` bytes puts `passwd`
+at `buff + max_packet + 1`, with 7 bytes of slack left.
+
+| branch | capabilities | consumer | reads |
+|---|---|---|---|
+| `strlen` | `!CLIENT_SECURE_CONNECTION` | `strlen(passwd)` | **unbounded** — until it finds a zero |
+| `len1` | `CLIENT_SECURE_CONNECTION` | `(uchar)(*passwd++)` | 1 byte — stays inside the slack |
+| `lenenc` | `+ ..._LENENC_CLIENT_DATA` | `safe_net_field_length_ll()` | up to 9 bytes |
+
+The `lenenc` branch is the interesting one, because it defeats a bound that
+exists to stop exactly this:
+
+```c
+    ulonglong len= safe_net_field_length_ll((uchar**)&passwd,
+                            net->read_pos + pkt_len - (uchar*)passwd);  /* :14581 */
+```
+
+and the helper takes that bound **unsigned**:
+
+```c
+my_ulonglong safe_net_field_length_ll(uchar **packet, size_t packet_len);
+```
+
+With `passwd == read_pos + pkt_len + 1` the difference is `-1`, which converts
+to `SIZE_MAX`. Every internal `if (packet_len < N) goto err` then passes, so the
+0xFE case runs `(*packet)+=9; return uint8korr(pos+1);` with no bound at all —
+`uint8korr` reads `pos[1..8]`, ending at `buff + max_packet + 9` while the last
+valid byte is `buff + max_packet + 7`. **Two bytes past the end of the block.**
+
+The same file already has the correct pattern, 400 lines earlier and also
+pre-auth, in `read_client_connect_attrs()`:
+
+```c
+  char *ptr_save= *ptr;
+  /* not enough bytes to hold the length */
+  if (ptr_save >= end)
+    return true;                                     /* :14195 -- the guard */
+  length= safe_net_field_length_ll((uchar **) ptr, end - ptr_save);
+```
+
+`parse_com_change_user_packet()` (`:14270`) has the same unguarded shape but is
+post-auth, so it is out of scope here and worth mentioning only upstream.
+
+#### Measured
+
+`poc_passwd_past_end.py`, packet exactly 16384 bytes (a multiple of `IO_SIZE`,
+so `net_realloc` leaves `max_packet == pkt_len` and the slack at its minimum),
+username running to the final byte. Whether the read leaves the block depends on
+the bytes following the buffer, which are **not** attacker-supplied — so the
+heap is made adversarial instead of the packet, with
+`ASAN_OPTIONS=malloc_fill_byte=254:max_malloc_fill_size=65536`: no zero byte
+anywhere, and 0xFE is what selects the 9-byte branch.
+
+```
+strlen -> AddressSanitizer: heap-buffer-overflow
+          READ of size 8 at 0x5290000ef228
+          0x5290000ef228 is located 0 bytes after 16424-byte region
+          #0 strlen  #1 parse_client_handshake_packet sql_acl.cc:14567
+
+len1   -> 3 reps, server survived, no report
+
+lenenc -> AddressSanitizer: unknown-crash
+          READ of size 8 at 0x5290000ef222
+          0x5290000ef228 is located 0 bytes after 16424-byte region
+          #0 uint8korr include/my_byteorder.h:128
+          #1 safe_net_field_length_ll sql-common/pack.c:110
+          #2 parse_client_handshake_packet sql_acl.cc:14581
+```
+
+ASAN calls the `lenenc` case `unknown-crash` rather than
+`heap-buffer-overflow` because the 8-byte read *straddles* the boundary — it
+starts addressable and ends in the redzone — so it cannot be attributed to one
+category; the `is located 0 bytes after` line and the shadow row
+`00 00 00 00 [00] fa fa …` pin the boundary.
+
+The offsets check out exactly: the 16424-byte region is
+`my_malloc`'s `HEADER_SIZE` (32) plus the requested `max_packet + 8` with
+`max_packet = 16384`, so `buff = region + 32`, the last valid byte is
+`region + 16423`, and `uint8korr(pos+1)` ends at `region + 16425`.
+
+Stack is pure pre-auth and owes nothing to my instrumentation — the hook was
+off (`MARIADB_FUZZ_HANDSHAKE=0`) and no poisoning was in effect:
+`check_connection` → `acl_authenticate` → `do_auth_once` →
+`native_password_authenticate` → `server_mpvio_read_packet` →
+`parse_client_handshake_packet`.
+
+**On a stock heap it does not fire: 400 reps at the triggering length, server
+survived, no report.**
+
+#### Why this is not an RCE, and what it actually is
+
+* The value is **discarded**. Whatever `passwd_len` comes back as, the common
+  guard `passwd + passwd_len + MY_TEST(db) > read_pos + pkt_len` is
+  unconditionally true once `passwd > read_pos + pkt_len`, so the packet is
+  rejected with `packet_error`. There is no path from the bytes read to
+  anything the client observes, so not even an information leak.
+* It is a **read**, and §4.17 shows there is no write primitive to pair it with.
+* Reaching past the block needs the memory after `net->buff` to contain no
+  zero byte (and, for `lenenc`, a 0xFE at `buff + max_packet + 1`). Those bytes
+  are not attacker-supplied through the protocol: no packet write ever reaches
+  the 8-byte slack, because `my_net_read()` writes data at `0..pkt_len-1` and a
+  zero at `pkt_len <= max_packet`. Arranging it means heap grooming, which I
+  have **not** demonstrated — and real heaps are full of zero bytes, which is
+  why the stock run is clean.
+* Even granting the read, the consequence is at most a crash if the scan walks
+  into an unmapped page. For the `strlen` branch that needs a zero-free run
+  from the buffer to the end of the mapping; for `lenenc` it is 2 bytes.
+
+So: a genuine pre-auth out-of-bounds read, conditional on heap contents,
+worth an upstream report and not a ZeroDay Cloud entry.
+
+#### Correction to §4.3
+
+§4.3 called this shape "reachable, not triggerable", on the grounds that the
+slack is `my_malloc`'d and a fresh mapping reads back as zeros. The first half
+is right and the second is the wrong reason to be reassured: it is a statement
+about what the allocator happens to hand over, not a bound. The accurate
+statement is the one above — the read *does* leave the allocation whenever the
+following memory has no zero in it, and what keeps it harmless is that the
+result is discarded, not that it cannot happen. §4.24's invariant argument
+(every region that ever held incoming data ends in a zero at a position no
+higher than `buff + max_packet`) bounds the scan to the slack **inside** the
+buffer only while that memory came from a previous packet; it says nothing
+about memory past `buff_end`, which is where these reports land.
+
+#### Fix
+
+One line, mirroring `read_client_connect_attrs()`, placed right after
+`passwd` is computed, bounding all three branches at once:
+
+```c
+   char *passwd= strend(user)+1;
++  if (passwd > (char*) net->read_pos + pkt_len)
++    return packet_error;
+```
+
+This rejects nothing that is accepted today: the existing guard already fails
+every packet that reaches it with `passwd` past the end.
+
 ## 5. What an auth bypass would actually buy on this target
 
 Worth knowing before spending effort on one, since a bypass to `root@%`
@@ -1348,9 +1621,16 @@ bypass line is closed.**
 
 ## 6. Status
 
-**No unauthenticated RCE found.** Two enumerations, both run over the
-*measured* pre-auth surface rather than a hand-written call graph, are the
-central results:
+**No unauthenticated RCE found.** One real memory-safety defect was found —
+§4.25, a pre-auth out-of-bounds *read* that leaves the `net->buff` heap block,
+reached from a single unauthenticated packet, with a one-line fix. It is not an
+RCE: the value read is discarded by the guard that follows, there is no write
+primitive to pair it with, and crossing the block boundary needs heap contents
+I have not shown to be attacker-controllable. Worth reporting upstream, not a
+competition entry.
+
+Otherwise, two enumerations, both run over the *measured* pre-auth surface
+rather than a hand-written call graph, are the central results:
 
 * **§4.17 — no write primitive.** 127 memory-writing call sites across 46 of
   the 290 measured pre-auth functions, each checked individually; every one is
@@ -1369,8 +1649,11 @@ And §5.1 closes the remaining route — a bypass followed by post-auth executio
 
 Specifically:
 
-* every out-of-bounds access found (§4.2, §4.3) is a *read* that provably stays
-  inside the `net->buff` allocation on this target;
+* every out-of-bounds access found is a *read*. §4.2 stays inside the
+  allocation; §4.3 does **not** always, which §4.25 corrects — it leaves the
+  block whenever the memory after `net->buff` holds no zero byte, and what
+  keeps it harmless is that the result is discarded, not that it cannot
+  happen;
 * the three write-shaped bugs found all need something an unauthenticated client
   cannot cause on this target — a concurrent `ALTER USER` (§4.8), an account with
   more than one authentication method (§4.5), or an IPv6-capable host and a
@@ -1419,6 +1702,11 @@ Done:
   recycled every 30,000 connections. No sanitizer report.
 * the pre-auth memory question settled at byte level (§4.20) ✔ — and the
   weaker RSS-based claim in §4.18 withdrawn
+* out-of-bounds reads attacked directly (§4.24, §4.25) ✔ — the research build
+  poisons the unused tail of `net->buff` during each re-parse, which is what
+  made §4.2/§4.3-shaped over-reads visible at all; it reproduced §4.3 with a
+  sanitizer stack trace, then found the second and third branches of the same
+  root cause, one of which (§4.25) crosses the allocation boundary
 
 Known limits of these results, stated rather than left implicit:
 * the in-process campaign parses from **accumulated, mutated state**, not from
@@ -1434,9 +1722,21 @@ Known limits of these results, stated rather than left implicit:
   sites), but the release build's devirtualisation was not separately checked.
 
 What is still outstanding, in order of expected value:
-* **Out-of-bounds reads as a class**, enumerated the way writes and indirect
-  calls were, over the same measured set. This is the one memory-safety class
-  not yet closed mechanically.
+* **Can the memory after `net->buff` be groomed?** This is what separates
+  §4.25 from a remote crash. The 8-byte slack is unreachable through the
+  protocol, so it would have to be heap layout: a freed block of the same size
+  class landing there with no zero byte in it. ASAN's quarantine and size
+  classes make the instrumented build a poor place to test this; it wants a
+  stock-allocator build.
+* **Extend the tail poisoning to the network parse** (§4.24) — six unpoison
+  sites: the two nested `my_net_read()` calls and the four write sites in
+  `sql_acl.cc`, since `net->buff` is shared between both directions. The hook
+  path has the volume but parses from mutated state (§4.21); the network path
+  is the faithful one.
+* **Out-of-bounds reads as a class**, enumerated mechanically over the measured
+  set the way writes and indirect calls were. §4.24/§4.25 attacked them with
+  instrumentation rather than enumeration, which found a bug but does not
+  bound the class.
 * **Re-pin `mariadb:latest` before any submission.**
 
 ## 7. Tooling in this directory
@@ -1481,6 +1781,17 @@ What is still outstanding, in order of expected value:
   `python3 -I indirect.py cov-preauth-only.txt <build>/sql/mariadbd`
   → 1,809 register / 73 memory / 0 GOT. Deduplicate to source locations with
   `addr2line -e <binary> -C -s`.
+* `poc_slack_scan.py` — §4.24: asks whether the tail of `net->buff` that the
+  §4.3 scan walks can be attacker-filled, using the second packet read inside
+  the `CLIENT_SSL` branch, and in its second phase using one connection's freed
+  buffer as the next connection's tail.
+* `poc_lenenc_bound.py` — §4.25: the length-encoded branch, where the bound
+  handed to `safe_net_field_length_ll()` goes negative and converts to
+  `SIZE_MAX`.
+* `poc_passwd_past_end.py` — §4.25: all three branches of the one root cause,
+  against a packet sized so the slack past `buff_end` is at its 8-byte minimum.
+  Run the server with `ASAN_OPTIONS=malloc_fill_byte=254:max_malloc_fill_size=65536`
+  to make the heap adversarial.
 * `probe_status.py` — §4.20: minimal authenticated client over the unix socket
   (native_password by hand), used to read MariaDB's own byte-exact
   `Memory_used` accounting, which RSS cannot substitute for on an ASAN build.

@@ -106,23 +106,30 @@ class Conn:
     def send_raw(self, data):
         self.sock.sendall(data)
 
-    def start_tls(self, caps=None):
-        """Send a 32-byte SSLRequest and upgrade the socket to TLS.
+    def start_tls(self, caps=None, request=None):
+        """Send an SSLRequest and upgrade the socket to TLS.
 
-        The SSLRequest packet is just the fixed 32-byte prefix of a handshake
-        response; the real response is then sent inside the TLS session, which
-        is the packet parse_client_handshake_packet() re-reads after
-        sslaccept().
+        The SSLRequest packet is normally just the fixed 32-byte prefix of a
+        handshake response; the real response is then sent inside the TLS
+        session, which is the packet parse_client_handshake_packet() re-reads
+        after sslaccept().
+
+        `request` replaces that prefix with a caller-supplied packet. Only the
+        capability words are parsed before sslaccept(), so a longer SSLRequest
+        is legal and its tail lands in net->buff -- which is what
+        poc_slack_scan.py uses to control the buffer tail the post-TLS parse
+        then walks.
         """
         import ssl
         if caps is None:
             caps = (CLIENT_LONG_PASSWORD | CLIENT_PROTOCOL_41 |
                     CLIENT_SECURE_CONNECTION | CLIENT_SSL)
-        req = (struct.pack("<I", caps & 0xffffffff) +
-               struct.pack("<I", 0x01000000) + bytes([45]) +
-               b"\x00" * 19 + struct.pack("<I", 0))
-        assert len(req) == 32
-        self.send_packet(req)
+        if request is None:
+            request = (struct.pack("<I", caps & 0xffffffff) +
+                       struct.pack("<I", 0x01000000) + bytes([45]) +
+                       b"\x00" * 19 + struct.pack("<I", 0))
+            assert len(request) == 32
+        self.send_packet(request)
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
