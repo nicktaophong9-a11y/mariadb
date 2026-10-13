@@ -933,6 +933,10 @@ alias `net->buff` across a `my_net_read()` is reassigned right after it —
 That is the central negative result: a memory-corruption RCE needs a write, and
 every write here is bounded by a correct size computation.
 
+**It also only saw calls, not assignments — closed in §4.36 by enumerating
+store instructions on the binary; 19 computed-address stores exist in the whole
+pre-auth surface and all are bounded.**
+
 **Transitive version, over the measured set rather than my hand list.** The 38
 sites above came from a call graph I wrote down, and the way that misses a
 primitive is by omitting a function. Re-running the same enumeration over all
@@ -2505,6 +2509,111 @@ in `strings/ctype-simple.c` and `mysys/charset.c`. Every one of those is
 byte-identical in today's trunk. **They are not rediscoveries of fixed bugs —
 they are live in current upstream MariaDB**, which is worth knowing before
 reporting them, and is the strongest argument for doing so.
+
+### 4.36 §4.17 had a hole: it never saw a plain assignment
+
+§4.17, the central negative result, enumerated writes by grepping the source
+for *calls* — `memcpy`, `memmove`, `strcpy`, `strmake`, `int4store`, `my_snprintf`
+and the rest. Every ordinary C assignment through a pointer is invisible to
+that: `*p = x`, `arr[i] = v`, `p->f = v` are not function calls. The clearest
+proof that this matters is that `create_fromuni`'s
+
+```c
+          tab[ofs]= ch;
+```
+
+is exactly such a store, it is the one place in the charset tier where an
+attacker-adjacent index meets a write, and **the enumeration never saw it** — I
+found it by reading the function in §4.22. So the claim "every memory write in
+the pre-auth call graph is bounded" was resting on a list of write *functions*,
+not on writes.
+
+`stores.py` (scratchpad) closes that the way §4.22 closed indirect calls: on the
+binary, where an assignment cannot hide behind not being a call. It streams
+`objdump -d -C` over the measured union set of §4.30 and classifies every store
+instruction by the shape of its destination address, because that is what
+decides whether an index can leave the object:
+
+```
+store destinations in the pre-auth set:
+  scaled-index (computed address) :    19
+  base+displacement               : 7,794
+  stack locals                    : 1,963
+```
+
+The 7,794 `off(%reg)` stores are `p->field = v` at constant offsets: those can
+only land outside an object if `p` is already wrong, which is the dangling-pointer
+question §4.5 settles, not an index question. The 19 with a scaled index are the
+ones where an out-of-bounds index is even expressible, and that is a small
+enough number to check individually:
+
+| function | sites | verdict |
+|---|---|---|
+| `create_fromuni` | 6 | `tab[ofs]= ch` under `from <= wc <= to`, and `cs->tab_from_uni[i]= idx[i].uidx` under `i < n`; inputs are compiled-in tables (§4.22, §4.30) |
+| `my_collation_statistics_inc_use_count` | 1 | see below |
+| `send_server_handshake_packet` | 1 | `orq $0x0,-0x8(%rsp,%rax,1)` — a `-fstack-clash-protection` probe, recognisable from the `lea 0x1f(%rsp); and $…e0` that follows. OR with 0 stores nothing |
+| `Warning_info::push_warning` | 1 | `m_warn_count[(uint) value->get_level()]++` into `uint m_warn_count[WARN_LEVEL_END]`; the index is the condition's level, server-chosen |
+| `find_collation_data_inheritance_source` | 1 | the `memcpy` of §4.30, guarded by `beg + MY_CS_COLLATION_NAME_SIZE > end` |
+| `str2int`, `my_qsort`, `normalize_dirname`, `plugin_foreach_with_mask`, `check_db_dir_existence`, `find_bookmark`, `reap_plugins` | 8 | not on the pre-auth path (§4.31 for `str2int`) or indexed by server data |
+
+**So §4.17 holds, and now over the class it had never covered.** 19 computed-address
+stores exist in the whole pre-auth surface and every one is bounded.
+
+#### A wrong turn worth recording
+
+The collation-statistics site looked for a while like a post-auth write
+primitive, and I was wrong about it in a way that is worth writing down because
+the mistake is easy to repeat.
+
+```c
+static inline void my_collation_statistics_inc_use_count(uint id)
+{
+  DBUG_ASSERT(my_collation_is_known_id(id));   /* no-op in a release build */
+  my_collation_statistics[id].use_count++;
+}
+```
+
+with `my_collation_statistics[MY_ALL_CHARSETS_SIZE]`, `MY_ALL_CHARSETS_SIZE`
+being 4096 — and its caller `get_internal_charset()` opens with another
+`DBUG_ASSERT(cs_number < array_elements(all_charsets))` before doing
+`all_charsets[cs_number]`. Two bounds, both compiled out of the shipped binary.
+Then `sql_acl.cc:14307`:
+
+```c
+    if (thd_init_client_charset(thd, uint2korr(next_field)))
+```
+
+`uint2korr` is **two** bytes, so 0..65535 against a 4096-entry array, and
+`thd_init_client_charset()` does not bound its argument either — it hands it
+straight to `get_charset()`. That reads like an out-of-bounds read whose value
+is then used as a `CHARSET_INFO *` and dereferenced, plus an out-of-bounds
+increment, both at an attacker-chosen offset up to ~490 KB.
+
+It is not, because the bound lives one frame further up, in `get_charset()`:
+
+```c
+  if (cs_number < array_elements(all_charsets))
+  {
+    ...
+    cs= get_internal_charset(&loader, cs_number, flags);
+  }
+```
+
+so `get_internal_charset()` is never entered with an out-of-range number, and
+the `DBUG_ASSERT`s restate a check the caller already made. A 16-bit collation
+id simply falls back to the server defaults.
+
+I had read the `DBUG_ASSERT` and concluded "no bound in release" without
+checking the caller. Recorded because §4.11 is a real instance of that shape —
+`prepare_hostname_cache_key()`'s `memcpy` genuinely has no bound but an
+assertion — and the two look identical until you follow the call chain. The
+lesson for this kind of audit is that "bounded only by `DBUG_ASSERT`" is a claim
+about the whole chain, not about the line.
+
+(The line is also post-auth regardless: 14307 is inside
+`parse_com_change_user_packet()`, and `COM_CHANGE_USER` needs an authenticated
+connection. Pre-auth, the collation comes from `net->read_pos[8]` — one byte,
+so ≤ 255 < 4096.)
 
 ## 5. What an auth bypass would actually buy on this target
 
