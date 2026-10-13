@@ -1910,6 +1910,141 @@ verified `process_str_arg`'s clamping for the unqualified `%s` in
 `ER_ACCESS_DENIED_ERROR` (MariaDB's template carries no precision specifier —
 the precision is MySQL's, which is the mistake §4.13 records me making).
 
+### 4.30 The blind spot in §4.17 and §4.22, measured and closed
+
+Both enumerations ran over the 290-function set from the coverage differential
+of §4.15, and that set is `cov-B − cov-A`: functions executed by pre-auth
+traffic **but not** by a bare start/stop. Two consequences I had not drawn:
+
+1. anything that runs at startup *and* pre-auth was subtracted away, even where
+   an unauthenticated client can re-enter it;
+2. the set is "what my own corpus reached", so a pre-auth-reachable function the
+   fuzzers never entered is outside both enumerations entirely.
+
+So "no write primitive" was only ever as strong as my corpus. `reach.py`
+(scratchpad) closes that: it builds the direct-call graph out of the binary,
+takes the transitive closure from 18 pre-auth entry points, cuts it at the
+post-auth boundary (`do_command`, `dispatch_command`,
+`prepare_new_connection_state`, `set_privs_on_login`, …) and compares.
+
+```
+functions in binary                    : 44,737
+statically reachable pre-auth          :    901
+  of those executed in the traffic run :    452
+  of those never executed              :    449
+differential set used by §4.17/§4.22   :    290
+  executed, in the closure, but DROPPED
+  by the differential (ran at startup) :    331
+```
+
+331 functions were executed, are pre-auth-reachable, and were thrown away by my
+own method — among them `Binary_string::alloc/realloc/copy/c_ptr`,
+`Diagnostics_area::push_warning`, the `Charset_collation_map_st` lookups: exactly
+the string and buffer machinery attacker data flows through. (Of the 290, only
+121 are in the static closure; the other 169 are reached through indirect or
+inlined edges a direct-call graph cannot see, which is why the corrected target
+is the *union* of the two, 621 functions, rather than the closure alone.)
+
+#### Re-run over the union: both results hold, and now without the blind spot
+
+Writes: **120 functions, 378 call sites** (was 46 / 127), so 110 write-bearing
+functions had never been enumerated. Triaged, no new primitive. The two shapes
+that looked like one:
+
+* `mysys/charset.c:846`, in `find_collation_data_inheritance_source()` —
+  `memcpy(name, beg, end - beg)` into `char name[MY_CS_COLLATION_NAME_SIZE + 1]`
+  is the shape of a stack overflow, but the condition that reaches it is
+  `(beg= cs->tailoring + 8) + MY_CS_COLLATION_NAME_SIZE > end`, i.e.
+  `end - beg < MY_CS_COLLATION_NAME_SIZE`, so the copy and the following
+  `name[end - beg]= '\0'` both land inside. Bounded, and `cs->tailoring` is
+  compiled-in or file-loaded data, not wire data.
+* `mysys/charset.c:886`, in `get_internal_charset()` —
+  `strxmov(get_charsets_dir(buf), cs->cs_name.str, ".xml", NullS)` is genuinely
+  unbounded, and its safety rests on `--character-sets-dir` being short:
+  `get_charsets_dir()` fills `buf` with up to `FN_REFLEN-1` bytes and `strxmov`
+  appends past that. Controlling that option means already owning the server, so
+  it is a robustness issue rather than a vector.
+
+The primitives §4.17's whole argument rests on were also never in the set, so
+they were never checked. They are correct:
+
+* `safe_strcpy(dst, dst_size, src)` — `strncpy(dst, src, dst_size)` then
+  `dst[dst_size - 1]= 0`; writes stay in `[0, dst_size)`.
+* `strnmov(dst, src, n)` — copies at most `n` bytes and deliberately does not
+  terminate, which is why its caller compares the result against `dst + n`
+  before writing `dst[dst_size-1]= 0`.
+* `strmake(dst, src, length)` — copies at most `length` and writes `*dst= 0` at
+  index `length`, so it needs `length + 1` bytes, which is exactly why
+  `strmake_buf(D, S)` passes `sizeof(D) - 1`.
+
+Indirect calls: **reg=2,972 / mem=558** over the union (was 1,809 / 73). Every
+memory-operand function new to this run falls in a category §4.22 already
+settled — PSI service pointers, the allocator size callback, the
+`error_log_handler_list` handlers, `lf_hash`'s comparison callback,
+`IO_CACHE::read_function`, `THD::m_internal_handler`, and the `CHARSET_INFO`
+handlers (`my_well_formed_length`, `Lex_ident_fs::check_body`) that the
+attacker's collation id selects among. No pointer takes its value from
+attacker bytes.
+
+So the larger enumeration **confirms** §4.17 and §4.22 instead of overturning
+them, and no longer depends on my differential's blind spot.
+
+#### The 449 that are reachable and were never executed
+
+Attributed to a file through the debug build's line info, every bucket has a
+reason, and all but one are closed by the target's own configuration:
+
+| bucket | functions | why it never ran |
+|---|---|---|
+| `pfs_*.cc`, `pfs.cc` | 32 | `performance_schema` is off |
+| `sql_cache.cc` | 35 | query cache off by default, and post-auth |
+| `debug_sync.cc`, `dbug.c` | 34 | debug build only, not in the release the target runs |
+| `xml.c`, `ctype.c` | 25 | the charset XML loader — see below |
+| `dtoa.c`, `my_vsnprintf.c` | 25 | float and other conversions no pre-auth template uses |
+| `hostname.cc` | 8 | `skip_name_resolve=ON` (§2) |
+| `sql_db.cc` | 7 | post-auth |
+| `sql_profile.cc` | 6 | profiling off |
+| `sql_audit.cc`/`.h` | 6 | no audit plugin loaded |
+| `proxy_protocol.cc` | 5 | `proxy_protocol_networks` unset |
+| `my_compress.c` | 4 | compression is post-auth (`net.compress` is set in `prepare_new_connection_state`) |
+| `my_sha224.cc` | 4 | `caching_sha2_password` / `sha256_password` are not loaded |
+
+(269 of the 449 attribute to a file; the rest are template instantiations and
+inlined helpers `nm` does not place.)
+
+#### The one bucket that is not config-closed — and a fidelity gap in my build
+
+`xml.c` / `ctype.c` is the `Index.xml` charset loader, and it *is*
+attacker-triggerable: `get_internal_charset()` enters
+
+```c
+    if (!(cs->state & (MY_CS_COMPILED|MY_CS_LOADED)))  /* if CS is not in memory */
+    {
+      strxmov(get_charsets_dir(buf), cs->cs_name.str, ".xml", NullS);
+      my_read_charset_file(&loader, buf, flags);
+    }
+```
+
+for any collation id whose charset is not compiled into the binary — and the
+collation id is byte 8 of the handshake response. §4.13 confirmed by direct
+query that **gb18030 is not compiled into the official image**, so on the target
+those ids reach this branch, open a file and run an XML parse before
+authentication.
+
+My instrumented build is built with the default charset set, which compiles
+*more* charsets in than the official package ships, so that branch never
+executes in any of my tests — which is precisely why 25 loader functions show
+up as reachable-but-never-executed. That is a fidelity gap between my build and
+the target, and I had not noticed it.
+
+What it is worth: the attacker chooses *whether* the loader runs, not what it
+parses. The filename is `charsets_dir` plus a compiled-in `cs_name`, and the
+file content is server-owned, so no wire data enters `my_xml_parse`. The
+exposure is a pre-auth file open and XML parse on demand, not attacker-supplied
+input to a parser. Recorded rather than chased for that reason, and because
+closing it properly means rebuilding with the package's exact
+`-DWITH_CHARSETS` set.
+
 ## 5. What an auth bypass would actually buy on this target
 
 Worth knowing before spending effort on one, since a bypass to `root@%`
@@ -2026,16 +2161,27 @@ competition entry.
 Otherwise, two enumerations, both run over the *measured* pre-auth surface
 rather than a hand-written call graph, are the central results:
 
-* **§4.17 — no write primitive.** 127 memory-writing call sites across 46 of
-  the 290 measured pre-auth functions, each checked individually; every one is
-  bounded by a correct size computation, or is post-auth, or is a name
-  collision that `gcov -f -m` attribution resolves.
-* **§4.22 — no attacker-supplied function pointer.** 1,882 indirect call sites
-  (1,809 register-operand, 73 memory-operand) in the same measured set,
-  deduplicated to 1,098 distinct source locations and triaged by the *source*
-  of the pointer. Every pre-auth function pointer comes from a compiled-in
-  table; the attacker chooses *which* valid table runs (collation id, TLS on or
-  off), never what a pointer contains.
+* **§4.17 — no write primitive.** 378 memory-writing call sites across 120
+  pre-auth functions, each checked individually; every one is bounded by a
+  correct size computation, or is post-auth, or is a name collision that
+  `gcov -f -m` attribution resolves. The bounded-copy primitives the argument
+  rests on — `safe_strcpy`, `strnmov`, `strmake` — are verified too (§4.30),
+  having been outside the first set entirely.
+* **§4.22 — no attacker-supplied function pointer.** 3,530 indirect call sites
+  (2,972 register-operand, 558 memory-operand), triaged by the *source* of the
+  pointer. Every pre-auth function pointer comes from a compiled-in table or a
+  server-set callback; the attacker chooses *which* valid table runs (collation
+  id, TLS on or off), never what a pointer contains.
+* **§4.30 — and both of those over the right set.** §4.17 and §4.22 first ran
+  over the 290 functions of the coverage differential, which is `cov-B − cov-A`
+  and therefore drops anything that also runs at startup — 331 pre-auth-reachable
+  functions, including `Binary_string::alloc/realloc/copy` and
+  `Diagnostics_area::push_warning`. Static reachability from the pre-auth entry
+  points gives 901 functions, 452 of them executed; re-running both
+  enumerations over the corrected union of 621 confirms both results instead of
+  overturning them. The numbers above are the corrected ones. The 449 reachable
+  functions that were never executed are accounted for bucket by bucket, all
+  but one closed by the target's own configuration.
 
 A memory-corruption RCE needs one or the other. Neither exists in this path.
 And §5.1 closes the remaining route — a bypass followed by post-auth execution
@@ -2195,6 +2341,12 @@ What is still outstanding, in order of expected value:
   against a packet sized so the slack past `buff_end` is at its 8-byte minimum.
   Run the server with `ASAN_OPTIONS=malloc_fill_byte=254:max_malloc_fill_size=65536`
   to make the heap adversarial.
+* `reach.py` — §4.30: static pre-auth reachability out of the binary. Builds
+  the direct-call graph with `objdump`, takes the closure from 18 pre-auth entry
+  points, cuts it at the post-auth boundary, and reports what the coverage
+  differential measured, what it dropped, and what is reachable but was never
+  executed. This is what bounds how much §4.17 and §4.22 depend on my corpus.
+  `python3 -I reach.py <build>/sql/mariadbd cov-preauth-only.txt <out-prefix>`
 * `probe_status.py` — §4.20: minimal authenticated client over the unix socket
   (native_password by hand), used to read MariaDB's own byte-exact
   `Memory_used` accounting, which RSS cannot substitute for on an ASAN build.
