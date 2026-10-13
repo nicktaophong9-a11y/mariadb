@@ -1782,6 +1782,25 @@ demonstrably sensitive — it produced five sites in minutes on code that ~250,0
 network cases had previously walked through in silence — so a clean run now
 says something about the inputs rather than about the instrument.
 
+**Then at volume.** `netcampaign.sh` ran 40 rounds of 25,000 randomised cases —
+**1,000,000 pre-auth cases** — against the poisoned build, restarting the server
+after any report so one finding could not stop the run. Every round came back
+`rc=0` with zero reports and the server alive. Unlike the in-process campaign
+this parses from true fresh-connection state (§4.21), so it is the faithful
+measurement; and unlike the earlier ~250,000 cases, the memory past the packet
+was poisoned throughout. For comparison, the first 20,000 cases under this
+regime found §4.27 at iteration 250.
+
+The in-process campaign reached **108,000,000 poisoned parses** with no report
+before being stopped — it shared port 3307 and the datadir with the network
+campaign, so the two could not run together, and the faithful one won.
+
+Taken together: of the five over-read sites, all five were found within the
+first 20,000 cases once the slack was poisoned, and a further 1,000,000 network
+cases plus 108,000,000 in-process parses produced nothing new. That is the
+strongest statement available here about the *inputs* having been explored,
+given a detector whose sensitivity is demonstrated rather than assumed.
+
 Two parsers were then read line by line, both pre-auth and both previously
 waved past on scope grounds rather than audited:
 
