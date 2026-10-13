@@ -1767,6 +1767,81 @@ so the battery can carry on to whatever is behind it. Both §4.25's and this
 fix are behind `MARIADB_PREAUTH_FUZZ_HOOK` and must not ship — they are there
 to stop known bugs masking unknown ones.
 
+### 4.28 The battery under the new detection regime, and two parsers finished off
+
+With §4.25 and §4.2 both patched in the research build and the tail poisoning
+live on the network path, the whole battery was re-run. **All eight stages
+clean, no sanitizer report:** 20,000 randomised cases, the four targeted PoC
+groups of §4.13/§4.14, the coverage-gap shapes of §4.15, the `next_field`
+boundary sweep, the post-TLS short packets, the slack-scan padding sweep and
+fill/scan pairs, 32-thread concurrency for 240 s, and the barrier-synchronised
+collation race over all 256 ids.
+
+That is worth more than the same result was worth yesterday. The detector is
+demonstrably sensitive — it produced five sites in minutes on code that ~250,000
+network cases had previously walked through in silence — so a clean run now
+says something about the inputs rather than about the instrument.
+
+Two parsers were then read line by line, both pre-auth and both previously
+waved past on scope grounds rather than audited:
+
+**`read_client_connect_attrs()`** — I had excluded the connection-attributes
+blob early on because its sink is the performance schema, which is off. That
+argument is about the sink; the *parser* runs regardless. It is sound:
+
+```c
+  if (ptr_save >= end) return true;                       /* the guard */
+  length= safe_net_field_length_ll((uchar **) ptr, end - ptr_save);
+  if (*ptr == NULL) return true;
+  if (*ptr + length > end) return true;
+  if (length > 65535) return true;
+```
+
+`length` is a `ulonglong` straight off the wire, so `*ptr + length` can wrap for
+a 9-byte length encoding and the third check would pass — but the 64 KB limit
+rejects every length large enough to wrap before anything uses it, so only
+values ≤ 65535 reach the sink and for those the pointer arithmetic is honest.
+Note the first guard here is exactly what §4.25's call site is missing.
+
+`is_connector_net_client()`, which runs whether or not the performance schema
+is on, is also guarded:
+
+```c
+  if (length < prefix.length)
+    return false;
+  if (connection_attrs[prefix.length - 1] != prefix.str[prefix.length - 1])
+    return false;
+  return !memcmp(connection_attrs, prefix.str, prefix.length);
+```
+
+both the fast path and the `memcmp` are covered by the length test, and
+`length` was already bounded by `*ptr + length <= end`, so the comparison stays
+inside the packet.
+
+**The non-compressed multi-packet reassembly** in `my_net_read_packet_reallen()`
+/ `my_real_read()`. §4.17 established that the `memmove`s there are
+compressed-branch, i.e. post-auth, but said nothing about the arithmetic of the
+path an unauthenticated client *can* drive with `0xFFFFFF` continuations:
+
+```c
+      len= uint3korr(net->buff + net->where_b);
+      if (!len) goto end;                        /* end of big multi-packet */
+      helping= MY_MAX(len, *complen) + net->where_b;
+      if (helping >= net->max_packet)
+        if (net_realloc(net, helping)) { len= packet_error; goto end; }
+      pos= net->buff + net->where_b;
+```
+
+The bound includes `where_b`, so it is the *accumulated* total that
+`net_realloc` tests against `max_packet_size`, not each segment on its own —
+which is the mistake that would have made this interesting. With
+`max_allowed_packet = 16777216` the first `0xFFFFFF` segment leaves
+`where_b = 16777215`, so any continuation of even one byte makes
+`helping >= 16777216` and is refused (§4.14). On the failure path
+`pos = net->buff + net->where_b` is never reached, so nothing is written at the
+advanced offset, and the caller restores `where_b = save_pos` before computing
+`read_pos`. Sound.
+
 ## 5. What an auth bypass would actually buy on this target
 
 Worth knowing before spending effort on one, since a bypass to `root@%`
