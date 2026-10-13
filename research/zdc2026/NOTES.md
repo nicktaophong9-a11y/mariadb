@@ -551,9 +551,31 @@ here.
   `2+1+SQLSTATE_LENGTH+MYSQL_ERRMSG_SIZE` = 520 bytes; with `CLIENT_PROTOCOL_41`
   `pos` is `buff+8` and `strmake(pos, converted_err, MYSQL_ERRMSG_SIZE-1)`
   writes through index 519 at worst — exactly in bounds. The message itself is
-  pre-truncated by `convert_error_message()` into a 512-byte buffer, and the
-  error templates bound their arguments with precision specifiers
-  (`ER_ACCESS_DENIED_ERROR` is `'%-.48s'@'%-.64s'`).
+  pre-truncated by `convert_error_message()` into a 512-byte buffer.
+  **Correction:** an earlier version of this note said the error templates bound
+  their arguments with precision specifiers and quoted
+  `'%-.48s'@'%-.64s'` for `ER_ACCESS_DENIED_ERROR`. That is MySQL's template,
+  not MariaDB's. MariaDB 13.0.2's `errmsg-utf8.txt` has
+  `eng "Access denied for user '%s'@'%s' (using password: %s)"` — **plain `%s`,
+  no precision** — and the same is true of `ER_ACCESS_DENIED_NO_PASSWORD_ERROR`.
+  So the attacker's username is *not* bounded by the format string. The chain is
+  still safe, but for a different reason: `my_vsnprintf()`'s `%s` handler
+  (`process_str_arg`) computes `left_len = (end - to) + 1`, reads the argument
+  with `strnlen(par, width)` rather than `strlen`, and then clamps with
+  `if (left_len <= plen) { plen = left_len - 1; length = plen; }` before
+  `strnmov`. An unspecified precision gives `width = MAX_WIDTH` (65535), so even
+  that scan is bounded. `par == NULL` is substituted with `"(null)"`, which
+  disposes of the separate worry about `my_error(..., sctx->user, ...)` being
+  reached before the username is set. The clamp applies independently at each of
+  the three stages — `my_error`'s `ebuff[MYSQL_ERRMSG_SIZE]`,
+  `convert_error_message`'s `converted_err[512]`, and this function's
+  `buff[520]` — which is what actually makes the path safe. `LOG_WARNINGS` is 2
+  on the target, so `login_failed_error()` additionally formats the same
+  arguments into `vprint_msg_to_log`'s `char buff[1024]`; same clamp, same
+  reasoning. The one unbounded-looking write in `process_str_arg` is the field
+  padding `strfill(to, length - plen - dots, ' ')`, which has no `end` check —
+  it is unreachable here only because `length` comes from a field width in the
+  format string and none of the pre-auth templates specify one.
 * **`ignore_max_password_errors()`** would `strcasecmp()` the account's
   `host.hostname` directly, which is a NULL dereference under the MySQL
   convention where a `%` host is stored as NULL. MariaDB's `update_hostname()`
@@ -707,6 +729,119 @@ the 16 MB `max_allowed_packet` (any non-zero continuation makes
 that way returns `ER_ACCESS_DENIED_ERROR`, which confirms the ~48 MB
 `THD::copy_fix()` allocation of §4.9 really does execute and complete.
 
+### 4.15 Measured coverage: what the testing actually reached
+
+Claiming "46,500 fuzz cases, no finding" is not evidence of anything on its own
+— it says nothing about which branches ran. So the whole battery was re-run
+against a third build (`-DCMAKE_BUILD_TYPE=Debug -DWITH_ASAN=ON` plus
+`--coverage`), which does two things at once: `DBUG_ASSERT` is live again, so any
+assertion that fires marks a condition the release build waves through — exactly
+the class of bug §4.11 is — and gcov records what was executed.
+
+Per-function line coverage, taken from gcov's own function attribution
+(`gcov -f`) rather than from a hand-written line-range guess, after 8,000 fuzz
+cases plus all four PoC suites:
+
+| function | covered |
+|---|---|
+| `parse_client_handshake_packet` | **96.05%** of 152 |
+| `native_password_authenticate` | **100%** of 26 |
+| `thd_init_client_charset` | **100%** of 26 |
+| `convert_error_message` | **100%** of 11 |
+| `my_net_init` / `net_allocate_new_packet` | **100%** |
+| `send_server_handshake_packet` | 92.06% of 63 |
+| `net_realloc` | 90.91% of 22 |
+| `my_real_read` | 89.25% of 93 |
+| `set_user_salt_if_needed` | 88.89% of 18 |
+| `net_send_error_packet` | 86.21% of 29 |
+| `err_conv` | 85.71% of 28 |
+| `read_client_connect_attrs` | 84.62% of 13 |
+| `login_connection` / `end_connection` | 86.96% / 92.86% |
+| `server_mpvio_write_packet` | 80.00% of 15 |
+| `net_write_command` | 75.00% of 32 |
+| `find_mpvio_user` | 65.31% of 49 |
+| `check_connection` | 60.00% of 40 |
+| `acl_authenticate` | 57.89% of 190 |
+| `net_real_write` | 52.38% of 63 |
+| `server_mpvio_read_packet` | 50.91% of 55 |
+| `do_auth_once` | 50.00% of 28 |
+| `handle_proxy_header` | 47.62% of 21 |
+| `check_require_secured_transport` | 42.86% of 7 |
+| `net_write_buff` | 36.00% of 25 |
+| `thd_set_peer_addr` | 30.77% of 39 |
+| `my_net_read_packet_reallen` | 27.71% of 83 |
+| `secure_auth` | **0%** of 11 |
+| `ignore_max_password_errors` | **0%** of 6 |
+
+**Every low number has a structural explanation that matches the scope analysis
+in §3, which is the useful part — the measurement corroborates the exclusions
+instead of just asserting them:**
+
+* `my_net_read_packet_reallen` 27.71% — the bulk of its body is the
+  `#ifdef HAVE_COMPRESS` compressed-protocol branch, and compression is
+  post-auth only (`net.compress=1` is set in `prepare_new_connection_state()`).
+* `thd_set_peer_addr` 30.77% — the `ip_to_hostname()` block is skipped under
+  `skip-name-resolve`, and the `AF_UNIX` and `ip == NULL` (PROXY protocol)
+  branches are unreachable over TCP without `proxy_protocol_networks`.
+* `net_write_buff` 36% and `net_real_write` 52% — the compressed and
+  larger-than-`max_packet` branches; the pre-auth server writes are a ~90-byte
+  greeting and short error packets.
+* `handle_proxy_header` 47.62% — `has_proxy_protocol_header()` and the `ABORT`
+  return *were* covered (the fuzzer sends both PROXY signature families); the
+  uncovered remainder is exactly everything behind
+  `is_proxy_protocol_allowed()`.
+* `do_auth_once` 50% — the `interface_version >> 8 == 0x01` compatibility path
+  and the `!plugin` → `ER_PLUGIN_IS_NOT_LOADED` path, which needs an account
+  naming an unloaded plugin.
+* `server_mpvio_read_packet` 50.91% and `acl_authenticate` 57.89% — the
+  `MPVIO_EXT::RESTART` machinery and the whole post-success tail (proxy user,
+  `acl_check_ssl`, password expiry, roles). No login ever succeeds here and no
+  account is non-native, so this is the expected shape.
+* `check_require_secured_transport` 42.86% — only the early return runs;
+  `require_secure_transport` is OFF.
+* `secure_auth` and `ignore_max_password_errors` at **0%** — independently
+  argued dead in §4.7 and §4.12, now measured dead.
+
+Within `parse_client_handshake_packet` the uncovered lines were individually
+inspected, and all but one pair are branches already established as unreachable:
+the `--skip-grant-tables` block (14641-14642, §4.7), the
+`ER_SECURE_TRANSPORT_REQUIRED` block (14497-14505), and —  usefully — the
+**`MPVIO_EXT::RESTART` cache-set block at 14689-14693**, i.e. the
+`cached_client_reply.pkt = passwd` assignment that §4.5's lifetime pattern
+depends on. It never executed, which is the measured confirmation that §4.5 is
+unreachable on this target rather than merely an argument about `nauth`.
+
+**Two genuinely untested branches turned up, and both were closed**
+(`poc_coverage_gaps.py`):
+
+1. **`sslaccept()` failure.** Every TLS case so far had completed its handshake,
+   so the rejection path — `return packet_error` after
+   `ssl_acceptor_stats_update(ssl_ret)`, with a half-built `SSL` object to tear
+   down — had never run. Ten malformed-TLS shapes were added (random bytes, a
+   truncated ClientHello, a fatal alert, a bogus record type, an SSLv2-style
+   header, an HTTP request, an immediate FIN, a single byte, a zero-length
+   record, a record claiming 0xFFFF bytes). Eight return `ER_HANDSHAKE_ERROR`,
+   two close the connection; lines 14477-14478 now show **10 executions**.
+2. **`net_realloc()`'s `ER_NET_PACKET_TOO_LARGE`.** Nothing sent so far had ever
+   declared more than `max_allowed_packet`, because a single packet's length
+   field caps at 0xFFFFFF — one byte below the 16 MB limit. Reaching it needs a
+   multi-packet whose continuation pushes `helping = len + where_b` over
+   `max_packet_size`. All four continuations tried (0xFFFFFF, 0x800000, 2 and
+   **1**) return `ER_NET_PACKET_TOO_LARGE`; lines 217-219 now show **4
+   executions**. That the continuation of length *one* already trips it is the
+   empirical confirmation of §4.14's derivation that `0xFFFFFF + 0` is the only
+   legal pre-auth multi-packet.
+
+After closing them, `parse_client_handshake_packet` is at **96.05%**,
+`net_realloc` at **90.91%**, `my_real_read` at **89.25%**.
+
+**No `DBUG_ASSERT` fired anywhere in the battery.** Across 8,000 fuzz cases, the
+four targeted PoC suites, the 256-collation sweep and the gap-closing cases, the
+assertion-enabled build produced zero assertion failures, zero sanitizer
+reports and zero crashes. Given §4.11 — a pre-auth `memcpy` whose only bound
+*is* a `DBUG_ASSERT` — this was the single most likely way to surface another
+bug of that class, and it found none in the paths that are reachable here.
+
 ## 5. What an auth bypass would actually buy on this target
 
 Worth knowing before spending effort on one, since a bypass to `root@%`
@@ -758,6 +893,13 @@ Done:
   quoted with truncated multi-byte tails, the `net_realloc` and 16 MB
   multi-packet shapes random fuzzing never produced, and a sweep of all 256
   collation ids. No sanitizer report.
+* the whole battery re-run against a Debug+ASAN+gcov build with `DBUG_ASSERT`
+  live, and the result *measured* rather than asserted (§4.15) ✔ —
+  `parse_client_handshake_packet` at 96.05% of its lines,
+  `native_password_authenticate` / `thd_init_client_charset` /
+  `convert_error_message` at 100%, every low-coverage function explained by a
+  scope exclusion that the measurement then corroborates, two genuinely
+  untested branches found and closed, and **no assertion failure anywhere**
 * 46,500 randomised pre-auth cases against the ASAN build ✔ — capability-flag
   combinations, charset ids, username/database/plugin-name shapes, all three
   auth-response length encodings, malformed connection-attribute blobs,
@@ -766,12 +908,13 @@ Done:
   numbers and PROXY-protocol signatures. No sanitizer report, no crash.
 
 What is still outstanding, in order of expected value:
-* **In-process fuzzing.** Network fuzzing caps out around 50 cases/second, which
-  is far too slow for this parser. The leverage is a harness that drives
-  `parse_client_handshake_packet()` directly — there is no in-tree libFuzzer
-  target for the protocol, so it means constructing a THD and ACL state outside
-  `mysqld`, or adding a debug-only entry point to the ASAN build (acceptable for
-  discovery; any finding must then reproduce on the stock binary).
+* **In-process fuzzing.** Network fuzzing caps out around 50 cases/second. The
+  measured coverage in §4.15 changes what this is worth, though: the reachable
+  pre-auth code is already at 96% of `parse_client_handshake_packet` and 100% of
+  the charset-selection and password-check paths, so more *coverage* is not the
+  gap — what in-process fuzzing would buy is many more *inputs per covered
+  branch*. Worth doing, but it is now a search for a deep input-dependent bug in
+  code that has been fully traversed, not for unexplored territory.
 * **Concurrency.** Everything so far was single-connection. The pre-auth path
   touches shared state — `acl_cache->lock`, the host-error counters, the
   password-error counters in §4.7 — and §4.8 is an index/lifetime bug that only
@@ -799,6 +942,9 @@ What is still outstanding, in order of expected value:
 * `verify_charset_tables.py` — static, no server needed: parses every
   range-guarded conversion-table lookup out of the charset sources and compares
   the table's real initializer length against the range its guard admits.
+* `poc_coverage_gaps.py` — §4.15: the two branches measured coverage showed were
+  never reached, a rejected TLS handshake and a multi-packet that exceeds
+  `max_allowed_packet`.
 
 ### Reproducing
 
