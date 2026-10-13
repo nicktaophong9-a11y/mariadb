@@ -2130,6 +2130,64 @@ than stumbled into, and §4.25 plus its post-auth twin are the only two
 instances in the pre-auth sources. That is the difference between "I did not
 find another one" and "I looked for another one".
 
+### 4.32 Can the memory after `net->buff` be groomed? Not this way
+
+§4.25 crosses the allocation boundary only when the bytes after `net->buff`
+contain no zero (and, for the `lenenc` branch, a 0xFE at `buff + max_packet + 1`).
+I showed that with `malloc_fill_byte=254` and left the real question open: can an
+unauthenticated client arrange it?
+
+There is a mechanism that looked like it should work. `do_handle_one_connection()`
+keeps the same `THD` across connections when a thread is cached:
+
+```c
+  for (;;)
+  {
+    if (thd_prepare_connection(thd))      /* authentication */
+      goto end_thread;
+    ...
+end_thread:
+    close_connection(thd);
+    unlink_thd(thd);
+    if (... || !(connect= thread_cache.park()))
+      break;
+    if (!(connect->create_thd(thd)))      /* reuses this THD */
+      break;
+```
+
+and the `goto end_thread` path means a **failed** pre-auth connection is
+followed by a reused `THD`. `CONNECT::create_thd(thd)` calls
+`thd->reset_for_reuse()` and then `my_net_init()`, which allocates a *fresh*
+`net->buff` while `net_end()` freed the old one — so on a stock allocator the
+next connection of the same size class is likely handed the same chunk back,
+contents intact. That is the grooming primitive I said I did not have.
+
+To test it without ASAN's quarantine hiding the reuse the research build gained
+a single switch: `MARIADB_PREAUTH_STOCK=1` turns off both the §4.25/§4.27 fixes
+and the tail poisoning, so the binary behaves like the shipped one while still
+running under ASAN. Combined with
+`quarantine_size_mb=0:thread_local_quarantine_size_kb=0`, freed chunks are
+reused immediately, the way glibc does and ASAN by default does not.
+
+`groom.py` then alternates a connection that writes 16384 non-zero bytes across
+`net->buff` and drops, with one whose username runs to the final byte so the
+§4.25 `strlen()` walks whatever follows. **60 pairs, server survived, no
+report.**
+
+The reason is a flaw in my own design, not a property of the allocator: the
+filling connection cannot write into the slack either. `my_net_read()` writes
+the body at `0..pkt_len-1` and a terminating zero at `pkt_len <= max_packet`,
+and the slack is the 8 bytes *after* `max_packet` — so no packet, filling or
+scanning, ever reaches it. Grooming those offsets needs the previous occupant of
+that memory to be some *other* allocation, not a `net->buff`.
+
+Pre-auth, the attacker does have allocations whose size they choose — the
+database-name conversion buffer of §4.9 goes up to tens of megabytes — so
+genuine heap grooming is not obviously impossible. But it is now a question
+about heap layout rather than about the protocol, the payoff is a read whose
+value is discarded, and the ceiling is a crash. Recorded as open, and not
+chased further on that basis.
+
 ## 5. What an auth bypass would actually buy on this target
 
 Worth knowing before spending effort on one, since a bypass to `root@%`
