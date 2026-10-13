@@ -2265,8 +2265,8 @@ rather than a hand-written call graph, are the central results:
   points gives 901 functions, 452 of them executed; re-running both
   enumerations over the corrected union of 621 confirms both results instead of
   overturning them. The numbers above are the corrected ones. The 449 reachable
-  functions that were never executed are accounted for bucket by bucket, all
-  every one of them unreachable by an unauthenticated client.
+  functions that were never executed are accounted for bucket by bucket, and
+  none of them is reachable by an unauthenticated client.
 
 A memory-corruption RCE needs one or the other. Neither exists in this path.
 And §5.1 closes the remaining route — a bypass followed by post-auth execution
