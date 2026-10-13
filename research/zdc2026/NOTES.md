@@ -1842,6 +1842,74 @@ which is the mistake that would have made this interesting. With
 advanced offset, and the caller restores `where_b = save_pos` before computing
 `read_pos`. Sound.
 
+### 4.29 The logging tier, which runs on every failed pre-auth login
+
+Easy to overlook because it is not part of the protocol, but the instrumented
+server's own log shows attacker bytes going through it before authentication:
+
+```
+[Warning] Access denied for user 'Ã©Ã©Ã©Ã©Ã©Ã©Ã©Ã©Ã©Ã©Ã©Ã©…'@'127.0.0.1'
+[Warning] Aborted connection 22188 to db: 'unconnected' user: 'unauthenticated'
+```
+
+`login_failed_error()` has three sinks, and two of them are live on the target:
+
+```c
+static void login_failed_error(THD *thd)
+{
+  my_error(access_denied_error_code(thd->password), MYF(0),
+           thd->main_security_ctx.user, thd->main_security_ctx.host_or_ip, ...);
+  general_log_print(thd, COM_CONNECT, ER_THD(thd, ...),
+                    thd->main_security_ctx.user, ...);
+  ...
+  if (global_system_variables.log_warnings > 1)
+    sql_print_warning(ER_DEFAULT(access_denied_error_code(thd->password)),
+                      thd->main_security_ctx.user, ...);
+}
+```
+
+* `my_error()` → the client error packet, audited in §4.13
+  (`ebuff[MYSQL_ERRMSG_SIZE]` → `converted_err[512]` → `buff[520]`).
+* `sql_print_warning()` → `error_log_print` → `vprint_msg_to_log`, which is
+  **active by default** since `log_warnings` defaults to 2:
+  ```c
+    char buff[1024];
+    length= my_vsnprintf(buff, sizeof(buff), format, args);
+  ```
+* `general_log_print()` → `LOGGER::general_log_print`, which formats
+  **unconditionally**, before `general_log_write()` checks `opt_log`:
+  ```c
+    char message_buff[MAX_LOG_BUFFER_SIZE];          /* 1024 */
+    if (format)
+      message_buff_len= my_vsnprintf(message_buff, sizeof(message_buff),
+                                     format, args);
+    return general_log_write(thd, command, message_buff, message_buff_len);
+  ```
+  So the username is written into a 1 KB stack buffer on every failed login
+  whether or not the general log is on; only the consumer is gated.
+
+All three pass `sizeof(dest)`, so the question is what `my_vsnprintf` does with
+it, and that matters well beyond here — the returned length is used as a length
+by its callers:
+
+```c
+  DBUG_ASSERT(to <= end);
+  *to='\0';
+  return (size_t) (to - start);
+```
+
+It returns the bytes **actually written**, not the would-be length the way C99
+`snprintf` does. That is the contract that makes
+`general_log_write(thd, command, message_buff, message_buff_len)` safe: an
+inflated length there would be an out-of-bounds read with an attacker-influenced
+size, on every failed login. It is not inflated.
+
+The formats are server constants throughout (`ER_DEFAULT`, `ER_THD`), never
+attacker data, so there is no format-string exposure either; and §4.13 already
+verified `process_str_arg`'s clamping for the unqualified `%s` in
+`ER_ACCESS_DENIED_ERROR` (MariaDB's template carries no precision specifier —
+the precision is MySQL's, which is the mistake §4.13 records me making).
+
 ## 5. What an auth bypass would actually buy on this target
 
 Worth knowing before spending effort on one, since a bypass to `root@%`
