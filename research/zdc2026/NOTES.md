@@ -2045,6 +2045,58 @@ input to a parser. Recorded rather than chased for that reason, and because
 closing it properly means rebuilding with the package's exact
 `-DWITH_CHARSETS` set.
 
+### 4.31 The §4.25 bug class, hunted on purpose instead of by accident
+
+§4.25's `lenenc` branch is a bound defeated by a pointer difference going
+negative and converting to an unsigned parameter. I found it by following an
+ASAN report, not by looking for it — which means the class deserved a
+systematic pass rather than one lucky hit. `narrow.py` (scratchpad) enumerates
+the two shapes across the pre-auth sources:
+
+* **DIFF** — a pointer or length difference passed as an argument, where a
+  negative value becomes enormous if the parameter is unsigned;
+* **CAST** — a narrowing or sign-changing cast applied to a length expression.
+
+Run over `sql_acl.cc`, `net_serv.cc`, `sql_connect.cc`, `pack.c`, `hostname.cc`,
+`viosocket.c`, `viossl.c`, and then over the conversion tier (`ctype.c`,
+`ctype-simple.c`, `ctype-utf8.c`, `ctype-mb.c`, `my_vsnprintf.c`,
+`sql_string.cc`, `sql_error.cc`, `m_ctype.h`), it reports 30 sites in the
+protocol files and 54 in the conversion tier. Most are the ordinary "cursor
+minus start equals bytes written" shape, non-negative by construction. The ones
+where the subtrahend could in principle exceed the minuend were read
+individually:
+
+| site | verdict |
+|---|---|
+| `sql_acl.cc:14198` `end - ptr_save` | guarded by `if (ptr_save >= end) return true;` (§4.28) |
+| `sql_acl.cc:14581` `read_pos + pkt_len - passwd` | **this is §4.25** |
+| `sql_acl.cc:14272`, `:14282` `end - passwd` | same shape, `parse_com_change_user_packet`, post-auth — for the upstream report, not this target |
+| `sql_acl.cc:13877` `SCRAMBLE_LENGTH - data_len` | inside `if (data_len < SCRAMBLE_LENGTH)`; and `data` comes from the server plugin, not the client |
+| `net_serv.cc:694`, `:719` `end - pos` | `pos` only advances by bytes actually written, so `pos <= end` holds |
+| `net_serv.cc:1212`, `:1213` | compressed branch, post-auth |
+| `my_vsnprintf.c:361` `length - res_length` | inside `if (res_length < length)`, with `length= MY_MIN(length, to_length)` and an earlier `if (res_length > to_length) return to;` above it, so `diff + res_length = length <= end - to` |
+| `sql_string.cc:522` `max_length - str_length` | in the `else` of `if (str_length > max_length)` |
+| `ctype-mb.c:985`, `:986` | `my_like_range_mb`, post-auth |
+
+`ctype-simple.c:172` is worth quoting, because it shows the codebase is alive to
+this class where it matters:
+
+```c
+  /*
+    We can't use (slen - tlen) here as the result may be outside of the
+    precision of a signed int
+  */
+  if (tlen == slen)
+    return 0;
+  *t_is_prefix= 0;
+  return slen > tlen ? 1 : -1;
+```
+
+So the class that produced the only real finding here has now been swept rather
+than stumbled into, and §4.25 plus its post-auth twin are the only two
+instances in the pre-auth sources. That is the difference between "I did not
+find another one" and "I looked for another one".
+
 ## 5. What an auth bypass would actually buy on this target
 
 Worth knowing before spending effort on one, since a bypass to `root@%`
@@ -2341,6 +2393,10 @@ What is still outstanding, in order of expected value:
   against a packet sized so the slack past `buff_end` is at its 8-byte minimum.
   Run the server with `ASAN_OPTIONS=malloc_fill_byte=254:max_malloc_fill_size=65536`
   to make the heap adversarial.
+* `narrow.py` — §4.31: sweeps the pre-auth sources for the bug class §4.25
+  belongs to — differences passed as unsigned arguments, and narrowing casts on
+  length expressions.
+  `python3 -I narrow.py <source-root> sql/sql_acl.cc sql/net_serv.cc ...`
 * `reach.py` — §4.30: static pre-auth reachability out of the binary. Builds
   the direct-call graph with `objdump`, takes the closure from 18 pre-auth entry
   points, cuts it at the post-auth boundary, and reports what the coverage
