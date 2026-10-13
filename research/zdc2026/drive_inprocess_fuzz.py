@@ -27,6 +27,7 @@ from mariadb_preauth import (  # noqa: E402
     CLIENT_CONNECT_WITH_DB, CLIENT_PLUGIN_AUTH, CLIENT_CONNECT_ATTRS,
     CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA, CLIENT_SECURE_CONNECTION,
     CLIENT_PROTOCOL_41, CLIENT_INTERACTIVE, CLIENT_IGNORE_SPACE, CLIENT_MYSQL,
+    CLIENT_SSL,
 )
 
 HOST = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
@@ -90,9 +91,19 @@ def main():
     for i in range(1, NCONN + 1):
         try:
             c = Conn(HOST, PORT, timeout=120.0)
-            if c.read_greeting() is None:
+            g = c.read_greeting()
+            if g is None:
                 c.close()
                 continue
+            # A share of the seeds go through the TLS upgrade, so the hook also
+            # pours volume into the packet re-read after sslaccept() -- the one
+            # with the weaker NORMAL_HANDSHAKE_SIZE check (NOTES §4.2).
+            if rnd.random() < 0.3 and (g["capabilities"] & CLIENT_SSL):
+                try:
+                    c.start_tls()
+                except Exception:                        # noqa: BLE001
+                    c.close()
+                    continue
             pkt = seed_packet(c, rnd)
             if len(pkt) > 8192:
                 pkt = pkt[:8192]

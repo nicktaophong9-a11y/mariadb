@@ -933,6 +933,36 @@ alias `net->buff` across a `my_net_read()` is reassigned right after it —
 That is the central negative result: a memory-corruption RCE needs a write, and
 every write here is bounded by a correct size computation.
 
+**Transitive version, over the measured set rather than my hand list.** The 38
+sites above came from a call graph I wrote down, and the way that misses a
+primitive is by omitting a function. Re-running the same enumeration over all
+290 functions from the coverage differential (§4.15) gives **127 memory-writing
+call sites across 46 functions** — 89 more than the hand list. Triaged, every
+one of the additions falls into four groups and none is a new primitive:
+
+* **already audited** under §4.6/§4.10/§4.12/§4.13;
+* **name collisions** — a `memcpy` in a same-named function in another
+  translation unit, which `gcov -f -m` attribution resolves;
+* **post-auth, reachable in the measured set only through the fidelity gap of
+  §4.19** (the `root@127.0.0.1` passwordless login that inflated the first
+  measurement) — `set_privs_on_login`, `do_command`, `send_ok`, `acl_check_ssl`;
+* **compressed-protocol branches**, which are post-auth because `net.compress`
+  is set in `prepare_new_connection_state()`: `net_real_write`'s
+  `memcpy(b + header_length, packet, len)` (`net_serv.cc:674`) sits inside
+  `if (net->compress)`, as do `my_net_read_packet_reallen`'s three `memmove`s
+  (`:1151`, `:1170`, `:1182`).
+
+Two sites outside those groups were read in full and are bounded:
+`print_aborted_warning()` (`sql_class.h`) uses `snprintf(real_ip_str,
+sizeof(real_ip_str), ...)` and its "real ip" branch is gated on
+`net.using_proxy_protocol`, unreachable without `proxy_protocol_networks`; its
+`ER_NEW_ABORTING_CONNECTION` template bounds all five arguments with precision
+specifiers (`%-.192s`, `%-.48s`, `%-.64s`, `%-.64s`, `%-.64s`).
+
+The negative result therefore holds over the *measured* surface, not just over
+a list I chose. For the control-flow dual of this enumeration — function
+pointers, which need no write at all — see §4.22.
+
 ### 4.18 Concurrency, measured
 
 Everything before this was single-connection. `preauth_concurrent.py` runs 32
@@ -951,6 +981,14 @@ oscillate — 371 MB, 950 MB, 724 MB, 834 MB above baseline — so memory is bei
 reclaimed. The peak is consistent with §4.9's per-connection amplification
 (32 concurrent connections each able to hold a ~48 MB conversion buffer), which
 is a resource-exhaustion vector bounded by `max_connections`, not a leak.
+
+> **Superseded, see §4.20.** The RSS argument in this paragraph is too
+> insensitive to support "memory is being reclaimed": at the growth rate that
+> later proved measurable, 233,624 connections amount to ~29 MB, well inside
+> the noise of these samples. The question is settled in §4.20 by MariaDB's own
+> byte-exact `Memory_used` accounting instead, and the answer is the same — the
+> stock pre-auth path does not accumulate — but the evidence here was not strong
+> enough to say so.
 
 Two related leads were closed by reading rather than guessing:
 
@@ -1003,6 +1041,208 @@ pre-auth only. The earlier negative results are unaffected (a successful login
 only adds code paths), but the measured "pre-auth" surface was too generous and
 is corrected here.
 
+### 4.20 Correction to §4.18: the pre-auth memory question, answered at byte level
+
+§4.18 concluded "no leak" from RSS being non-monotonic over 233,624 concurrent
+pre-auth rounds. That conclusion was under-powered and I am withdrawing the
+reasoning behind it. At the growth rate that later turned out to be measurable,
+233,624 connections would have accounted for roughly 29 MB — comfortably inside
+the noise of an RSS sample taken from `/proc/<pid>/status` on a server whose
+baseline is ~470 MB. §4.18 did not rule the question out; it merely could not
+see it.
+
+What forced the issue was the in-process campaign dying at seed 22100. That was
+**not** a crash:
+
+```
+oom-kill:constraint=CONSTRAINT_MEMCG,...,task=mariadbd,pid=32096
+Memory cgroup out of memory: Killed process 32096 (mariadbd)
+    total-vm:30077313968kB, anon-rss:13891348kB
+```
+
+no ASAN report, no assertion, and an error log that simply stops mid-line on
+ordinary `Access denied` warnings — the signature of `SIGKILL`. 13.9 GB over
+~110 M parses is ~126 B per parse, and the driver closes every connection
+(`c.close()`) and runs strictly sequentially, so per-connection teardown should
+have reclaimed it. That is what made it worth measuring properly rather than
+dismissing.
+
+RSS cannot answer the question, because it is the high-water mark of the ASAN
+allocator, which does not return its regions to the OS. MariaDB's own
+accounting can: `Memory_used` is maintained by `update_malloc_size()` and
+reports live tracked bytes. Reading it needs an authenticated session, so
+`probe_status.py` (scratchpad) speaks native_password over the unix socket as
+`root@localhost` — the socket is used deliberately, because it matches an
+account that exists in the official set rather than adding one.
+
+Stock pre-auth path, hook off, one parse per connection, 5,000 connections per
+batch:
+
+| batch | ΔMemory_used | per connection |
+|-------|--------------|----------------|
+| 1 | +2,446,408 B | +489 B (first touch: thread caches) |
+| 2 | +667,672 B | +133 B |
+| 3 | **−671,744 B** | **−134 B** |
+| 4 | +802,816 B | +160 B |
+
+The deltas oscillate about zero and one of them is negative; +667,672 and
+−671,744 are the same ~670 KB thread-cache block being taken and given back.
+**The stock pre-auth path does not accumulate memory**, measured to the byte
+over 20,000 connections. The 13.9 GB is an artifact of the research hook, which
+performs its N re-parses *inside a single connection*, before any teardown can
+run, multiplying the per-connection peak by N.
+
+For the competition this is a dead end either way: memory growth is not a write
+primitive, and at one parse per connection there is no exhaustion vector to
+speak of. It is recorded because the earlier claim was weaker than it sounded.
+
+### 4.21 A fidelity limit of the in-process hook, and what it does to §4.19
+
+With `MARIADB_FUZZ_HANDSHAKE=5000` set, my own legitimate login was refused:
+
+```
+login failed: #28000Access denied for user 'root'@'localhost' (using password: YES)
+```
+
+The hook saves and restores `thd->client_capabilities`, `mpvio->acl_user` and
+`mpvio->curr_auth`, but `parse_client_handshake_packet()` also writes
+`mpvio->status`, `mpvio->cached_client_reply` and — via
+`my_free(sctx->user); sctx->user= my_strndup(...)` — the security context's
+username, none of which the hook puts back. So the real parse that follows the
+mutated ones starts from state the mutations left behind.
+
+That bounds what §4.19 proves. The in-process campaign explores
+`parse_client_handshake_packet()` **from accumulated, mutated state**, not from
+the state of a fresh connection; only the network campaigns (~250,000 cases)
+are faithful to a fresh connection. Since neither found a crash, the caveat
+does not invalidate a finding — it limits the reach of a negative result, and
+that is worth stating plainly rather than letting the parse count speak for
+itself.
+
+Two consequences, both applied: a lower N gives better fidelity per parse (the
+state drifts less far before the real parse), and the server is now recycled
+every 30,000 connections so the harness's own accumulation cannot reach OOM
+again. The campaign now runs at N=200 with recycling; as of this writing
+42,000,000 in-process parses with no sanitizer report and RSS flat at ~1.33 GB
+per round.
+
+Anything the hook ever flags must still be reproduced over the network against
+an unmodified binary before it counts. That was always the rule; it matters
+more now that the state divergence is understood.
+
+### 4.22 Every indirect call in the pre-auth call graph, enumerated
+
+§4.17 showed there is no unbounded write pre-auth, which closes
+memory-corruption-by-write. But a control-flow hijack does not need a write at
+all: it needs a **function pointer** whose value attacker data can influence,
+or one that is read before it is initialised. That is the dual question and
+§4.17 does not touch it.
+
+Enumerated on the binary rather than the source, so that macros, templates and
+virtual dispatch cannot hide a site (`indirect.py`, scratchpad): stream
+`objdump -d -C` over `build-dbg/sql/mariadbd`, keep only the functions in the
+*measured* 290-function pre-auth set from §4.15, and classify every `call`/`jmp`
+with a `*` operand.
+
+```
+measured functions located in binary: 301 / 290     (clones and .cold parts)
+indirect sites: reg=1809  mem=73  got=0
+1882 unique addresses -> 1098 distinct source locations (addr2line)
+```
+
+`got=0` is expected: external calls go through a direct `call` to a PLT stub,
+not a `*(%rip)` load. `reg=1809` is inflated by the `-O0` debug build, where
+every C++ method call through a loaded pointer materialises as `call *%rax`.
+
+Triaging by the *source of the pointer* rather than by site, every pre-auth
+function pointer comes from one of these, and none takes its value from
+attacker bytes:
+
+| structure | selected by | notes |
+|---|---|---|
+| `Vio` method table | attacker, via `CLIENT_SSL` | two compiled-in tables; see §4.23 |
+| `CHARSET_INFO::cset` / `::coll` | attacker, via the collation id byte | static tables, lazily initialised (§4.16) |
+| `st_mysql_auth::authenticate_user` | server | plugin comes from `default_auth_plugin_name` or `acl_user->auth[]`, never from the client (§5) |
+| `MY_CHARSET_LOADER::once_alloc` | server | `create_fromuni`, both sites NULL-checked |
+| PSI service table | server config | `performance_schema` |
+| audit plugin table | server config | dominates the count (`sql_audit.h`); no audit plugin is loaded on the target |
+| `scheduler_functions` | server config | thread handling |
+| comparison callbacks passed as parameters | server | e.g. `find_by_username_or_anon`'s `bool (*)(ACL_USER*, char const*, char)` |
+
+Sites I checked individually because they looked attacker-adjacent:
+
+* `create_fromuni` (`ctype-simple.c:1418`, `:1459`) — in the measured set, so
+  pre-auth traffic really does reach charset table construction. Both indirect
+  calls are `(loader->once_alloc)(...)`, server-supplied and NULL-checked. The
+  table fill is in bounds: `ofs = wc - idx[i].uidx.from` under the guard
+  `from <= wc <= to`, so `0 <= ofs <= numchars-1`, and `from`/`to` come from the
+  compiled-in `tab_to_uni[]`, not from the wire. The attacker chooses *which*
+  charset is initialised, not what it is initialised from.
+* `find_mpvio_user` → `charset_info_st::hash_sort` (`m_ctype.h:1245`, called at
+  `sql_acl.cc:14108`) — dispatches through `coll->hash_sort`, but on
+  `CHARSET_INFO *cs= &my_charset_latin1`, hardcoded, and latin1 is statically
+  initialised. Not attacker-selected.
+* `do_auth_once` → `info->authenticate_user` — see §5.
+* `acl_check_ssl` (reached inlined from `do_auth_once`) — OpenSSL calls, and
+  every official account has an empty `ssl_type`, so it returns 0 early.
+
+So a hijack would need a write to corrupt one of those tables, and §4.17 says
+there is no write to be had. The two enumerations together close
+memory-corruption RCE in the pre-auth path: no unbounded write, and no pointer
+an attacker can supply.
+
+What this does **not** close: an OOB *read* (an info leak is not an RCE but
+could feed one), and a bug in a path neither enumeration covers — which is why
+the measured function set, not a hand list, is the input to both.
+
+### 4.23 The TLS glue: handlers are installed only after the handshake, and a second `sslaccept()` is impossible
+
+The one way a static method table turns dangerous is if it is installed early
+and left behind on an error path. For the pre-auth TLS upgrade it is not.
+`ssl_do()` (`vio/viossl.c`):
+
+```c
+  if (!(ssl= SSL_new(ptr->ssl_context))) { *errptr= ERR_get_error(); return 1; }
+  ...
+  if ((r= ssl_handshake_loop(vio, ssl, func)) < 1)
+  {
+    *errptr= SSL_errno(ssl, r);
+    SSL_free(ssl);
+    DBUG_RETURN(1);                 /* vio_reset() has NOT run yet */
+  }
+  if (vio_reset(vio, VIO_TYPE_SSL, SSL_get_fd(ssl), ssl, 0))
+    DBUG_RETURN(1);
+```
+
+`ssl` is a local and is only published into the `Vio` by `vio_reset()`, which
+runs **after** the handshake succeeds. On every failure path the `Vio` still
+carries the plain-TCP table and an untouched `ssl_arg`, so the teardown that
+follows `return packet_error` in `parse_client_handshake_packet()` cannot
+dispatch through SSL methods or touch the freed `SSL`. No stale table, no
+use-after-free. (Malformed-TLS shapes were also driven over the network:
+§4.15.)
+
+That leaves a second upgrade on the same `Vio`, which would call `vio_reset()`
+again over a live `SSL`. It cannot happen, and the guard is not where I first
+looked: `mpvio->packets_read` is only ever incremented
+(`sql_acl.cc:14914`, `:14934`, `:15244`) and never reset, starting from 0, so
+
+```c
+  if (mpvio->packets_read == 1)
+    pkt_len= parse_client_handshake_packet(mpvio, buf, pkt_len);
+```
+
+is true for exactly one call per connection. `parse_client_handshake_packet()`
+runs at most once, therefore its `CLIENT_SSL` branch and `sslaccept()` run at
+most once, including across an auth-plugin RESTART (which re-enters
+`server_mpvio_read_packet` but with `packets_read > 1`, taking the cached-reply
+or re-read path instead).
+
+Correction to my own note: the line clearing `CLIENT_SSL` out of the packet at
+`sql_acl.cc:14851` is part of **my research hook**, not a MariaDB guard — I
+read it out of the modified tree and briefly took it for upstream code. MariaDB's
+guard is the `packets_read` monotonicity above.
+
 ## 5. What an auth bypass would actually buy on this target
 
 Worth knowing before spending effort on one, since a bypass to `root@%`
@@ -1021,13 +1261,113 @@ running container):
 not obviously RCE here: an entry needs a bypass **plus** a code-execution
 primitive, or memory corruption that gets there directly.
 
+### 5.1 And why there is no bypass to be had
+
+The decision is made by exactly one rejection site in `acl_authenticate()`:
+
+```c
+  if (res > CR_OK && mpvio.status != MPVIO_EXT::SUCCESS)
+  { ... inc_host_errors(...); login_failed_error(thd); DBUG_RETURN(1); }
+  sctx->proxy_user[0]= 0;                 /* reaching here grants the login */
+```
+
+It needs **both** conditions to reject, so there are two ways to fail open:
+`res <= CR_OK`, or `mpvio.status == SUCCESS` despite an error. Four facts close
+both, and each is checked rather than assumed:
+
+1. **`mpvio.status` can never become `SUCCESS` pre-auth on this target.**
+   `MPVIO_EXT::SUCCESS` is assigned at exactly two places in the whole tree
+   (`sql_acl.cc:14341`, `:14649`) and both sit inside `if (!initialized)`, i.e.
+   only under `--skip-grant-tables`. `static bool initialized=0` (`:725`) is set
+   to 1 at exactly one site, `acl_init()` (`:2989`). The target runs with grant
+   tables, so the rejection reduces to `res > CR_OK`.
+
+2. **No server-side path returns `CR_OK_HANDSHAKE_COMPLETE` (−2).** This
+   matters because the unknown-user guard compares exactly:
+   ```c
+   if (mpvio.make_it_fail && res == CR_OK) { mpvio.status= FAILURE; res= CR_ERROR; }
+   ```
+   −2 does not match, and `−2 > −1` is false, so a −2 would grant the login to
+   an unknown user. Every `return CR_OK_HANDSHAKE_COMPLETE` in the tree is
+   client-side — `libmariadb/plugins/auth/*`, `sql-common/client.c`, the client
+   halves of dialog/gssapi/sspi, and `plugin/auth_examples/*` which release
+   builds do not ship. `plugin_auth_common.h` states the contract outright:
+   *"Server plugins should not return this value."*
+
+3. **The client never chooses the server's plugin.** `do_auth_once()` is called
+   with `default_auth_plugin_name` (`:15266`) or `acl_user->auth[curr_auth].plugin`
+   (`:15288`) — both server-side. `get_auth_plugin()` compares by pointer
+   identity (`name.str == native_password_plugin_name.str`) and otherwise goes
+   through `my_plugin_lock_by_name(thd, &name, MYSQL_AUTHENTICATION_PLUGIN)`,
+   which enforces the plugin type. The client's plugin name only triggers an
+   auth-switch request. So no type confusion onto `st_mysql_auth`.
+
+4. **The one fail-open in `do_auth_once()` is not reachable with shipped
+   plugins.** Its dispatch is
+   ```c
+   switch (info->interface_version >> 8) {
+   case 0x02: res= info->authenticate_user(...); break;
+   case 0x01: ... break;
+   default: DBUG_ASSERT(0);          /* no-op in a release build */
+   }
+   ```
+   `res` is initialised to `CR_OK`, so a plugin whose `interface_version >> 8`
+   is neither 1 nor 2 would be granted the login *without `authenticate_user`
+   ever being called*. Every server auth plugin in the tree declares
+   `MYSQL_AUTHENTICATION_INTERFACE_VERSION`, which is `0x0203` → `>> 8 == 2`.
+   Worth reporting upstream as defence-in-depth — a `default:` that leaves a
+   success value standing is the wrong default — but it is not an unauth vector,
+   because the attacker cannot influence which plugin an account uses.
+
+That leaves the native plugin's own logic, which is tight:
+`native_password_authenticate()` returns `CR_OK` outside the crypto check in
+exactly one branch — `pkt_len == 0` (no password sent) **and**
+`info->auth_string_length == 0` (the account has no password). Otherwise it
+needs `pkt_len == SCRAMBLE_LENGTH`, a 20-byte stored hash, and
+`check_scramble()` to pass.
+
+So the question becomes whether any account on the target has an empty
+password. Dumped from the official container, authoritatively:
+
+| account | auth_string | locked |
+|---|---|---|
+| `demo@%`, `root@%`, `root@localhost` | `*52CB4371…` | — |
+| `healthcheck@127.0.0.1`, `@::1`, `@localhost` | `*4A65F9E8…` | — |
+| **`mariadb.sys@localhost`** | **"" (empty)** | **true** |
+
+Exactly one, and it is covered twice over: the host is restricted to
+`localhost` (a remote attacker's host never matches, and PROXY-protocol source
+spoofing is out — `proxy_protocol_networks` is unset, §4.12), and even on a
+host match `acl_authenticate()` rejects it at
+`if (acl_user->account_locked) { my_error(ER_ACCOUNT_HAS_BEEN_LOCKED); DBUG_RETURN(1); }`,
+which sits after the password check inside `if (initialized)`.
+
+For an unknown user, `find_mpvio_user()` fabricates a row and sets
+`make_it_fail`, and fact 2 shows that guard cannot be slipped. **The auth
+bypass line is closed.**
+
 ## 6. Status
 
-**No unauthenticated RCE found. No write primitive reachable pre-auth, and no
-authentication bypass.** The central result is §4.17: every one of the 38
-memory-writing call sites in the pre-auth call graph was enumerated and checked
-individually, and all are bounded by a correct size computation — so there is no
-write primitive for a memory-corruption RCE to use. Specifically:
+**No unauthenticated RCE found.** Two enumerations, both run over the
+*measured* pre-auth surface rather than a hand-written call graph, are the
+central results:
+
+* **§4.17 — no write primitive.** 127 memory-writing call sites across 46 of
+  the 290 measured pre-auth functions, each checked individually; every one is
+  bounded by a correct size computation, or is post-auth, or is a name
+  collision that `gcov -f -m` attribution resolves.
+* **§4.22 — no attacker-supplied function pointer.** 1,882 indirect call sites
+  (1,809 register-operand, 73 memory-operand) in the same measured set,
+  deduplicated to 1,098 distinct source locations and triaged by the *source*
+  of the pointer. Every pre-auth function pointer comes from a compiled-in
+  table; the attacker chooses *which* valid table runs (collation id, TLS on or
+  off), never what a pointer contains.
+
+A memory-corruption RCE needs one or the other. Neither exists in this path.
+And §5.1 closes the remaining route — a bypass followed by post-auth execution
+— at the single rejection site in `acl_authenticate()`, with four checked facts.
+
+Specifically:
 
 * every out-of-bounds access found (§4.2, §4.3) is a *read* that provably stays
   inside the `net->buff` allocation on this target;
@@ -1035,8 +1375,13 @@ write primitive for a memory-corruption RCE to use. Specifically:
   cannot cause on this target — a concurrent `ALTER USER` (§4.8), an account with
   more than one authentication method (§4.5), or an IPv6-capable host and a
   link-local peer (§4.11);
-* the authentication decision logic (§4.7) is sound, with one latent gap that no
-  loaded plugin can reach.
+* the authentication decision logic (§4.7, §5.1) is sound; the one latent
+  fail-open (`do_auth_once`'s `default:` leaving `res == CR_OK`, §5.1 fact 4) is
+  unreachable with any shipped plugin and is worth an upstream report as
+  defence-in-depth, not a competition entry;
+* the pre-auth TLS glue (§4.23) installs its method table only after the
+  handshake succeeds, and `packets_read` monotonicity makes a second
+  `sslaccept()` on one connection impossible.
 
 Done:
 * target pinned, configuration and account set read out of the running image ✔
@@ -1046,56 +1391,54 @@ Done:
   (`check_connection`/`thd_set_peer_addr`/`vio_peer_addr`), the ACL lookup and
   host matching, the error-formatting path (`err_conv`, `net_send_error_packet`)
   and the host-error accounting ✔
-* ASAN build of 13.0.2 and targeted PoCs for §4.2 and §4.3 ✔
-* the charset conversion tier verified end to end (§4.13): ten decoders, ten
+* the charset conversion tier verified end to end (§4.13) ✔ — ten decoders, ten
   encoders, five generic engines, the printable-escape arithmetic, and all 55
   conversion tables checked mechanically against the index ranges their guards
-  allow ✔
-* targeted stress of the arithmetic that had only been checked on paper
-  (`poc_deep_targeted.py`) ✔ — `err_conv`/`net_send_error_packet` at every
-  buffer boundary, the username boundary across eleven charsets bare and
-  quoted with truncated multi-byte tails, the `net_realloc` and 16 MB
-  multi-packet shapes random fuzzing never produced, and a sweep of all 256
-  collation ids. No sanitizer report.
-* all 38 memory writes in the pre-auth call graph enumerated and individually
-  bounded (§4.17) ✔
-* the pre-auth surface *measured* rather than listed by hand, by coverage
-  differential (§4.16, §4.19) ✔ — which found the lazy collation builders that
-  the hand-written scope had missed, and a fidelity bug in the test rig
-* concurrency (§4.18) ✔ — 233,624 rounds over 32 threads, with RSS sampling as
-  an independent leak check; no sanitizer report, no monotonic growth
-* the lazy collation-initialisation race (§4.16) ✔ — 6,120 barrier-synchronised
-  connections across all 256 collation ids on a freshly started server
-* in-process fuzzing (§4.19) ✔ — hook verified live by A/B timing (140 ms vs
-  1031 ms per 100 seeds), 10,000,000 mutated parses with no sanitizer report
-* the whole battery re-run against a Debug+ASAN+gcov build with `DBUG_ASSERT`
-  live, and the result *measured* rather than asserted (§4.15) ✔ —
-  `parse_client_handshake_packet` at 96.05% of its lines,
+  allow
+* the pre-auth surface *measured* by coverage differential rather than listed by
+  hand (§4.15) ✔ — `parse_client_handshake_packet` at 96.05% of its lines,
   `native_password_authenticate` / `thd_init_client_charset` /
-  `convert_error_message` at 100%, every low-coverage function explained by a
-  scope exclusion that the measurement then corroborates, two genuinely
-  untested branches found and closed, and **no assertion failure anywhere**
-* 46,500 randomised pre-auth cases against the ASAN build ✔ — capability-flag
-  combinations, charset ids, username/database/plugin-name shapes, all three
-  auth-response length encodings, malformed connection-attribute blobs,
-  truncation at the 31/32 boundary, multi-packet bodies, auth-switch replies
-  above `net_buffer_length`, TLS-upgraded connections, desynchronised sequence
+  `convert_error_message` at 100%, two genuinely untested branches found and
+  closed, no assertion failure anywhere with `DBUG_ASSERT` live
+* **both** enumerations over that measured set: writes (§4.17) and indirect
+  calls (§4.22) ✔
+* the auth-bypass line closed with the official account set dumped from the
+  running container (§5.1) ✔
+* concurrency (§4.18) ✔ — 233,624 rounds over 32 threads; and the lazy
+  collation-initialisation race (§4.16) ✔ — 6,120 barrier-synchronised
+  connections across all 256 collation ids on a freshly started server
+* network fuzzing ✔ — ~250,000 randomised and targeted pre-auth cases against
+  the ASAN build: capability-flag combinations, charset ids,
+  username/database/plugin-name shapes, all three auth-response length
+  encodings, malformed connection-attribute blobs, truncation at the 31/32
+  boundary, multi-packet bodies, auth-switch replies above `net_buffer_length`,
+  TLS-upgraded and deliberately-failed-TLS connections, desynchronised sequence
   numbers and PROXY-protocol signatures. No sanitizer report, no crash.
+* in-process fuzzing (§4.19, §4.21) ✔ — hook verified live by A/B timing
+  (140 ms vs 1031 ms per 100 seeds); campaign now runs at N=200 with the server
+  recycled every 30,000 connections. No sanitizer report.
+* the pre-auth memory question settled at byte level (§4.20) ✔ — and the
+  weaker RSS-based claim in §4.18 withdrawn
+
+Known limits of these results, stated rather than left implicit:
+* the in-process campaign parses from **accumulated, mutated state**, not from
+  fresh-connection state (§4.21); only the network campaigns are faithful to a
+  fresh connection, and anything the hook flags must be reproduced over the
+  network against an unmodified binary before it counts;
+* neither enumeration closes an out-of-bounds **read**. An info leak is not an
+  RCE, but it could feed one, and §4.2/§4.3 are both reads that happen to stay
+  in bounds *on this target* — a different allocator state would change that
+  argument, not the code;
+* the `-O0` debug build used for §4.22 has more indirect calls than the release
+  binary the target runs; that direction is conservative (it over-reports
+  sites), but the release build's devirtualisation was not separately checked.
 
 What is still outstanding, in order of expected value:
-* **In-process fuzzing.** Network fuzzing caps out around 50 cases/second. The
-  measured coverage in §4.15 changes what this is worth, though: the reachable
-  pre-auth code is already at 96% of `parse_client_handshake_packet` and 100% of
-  the charset-selection and password-check paths, so more *coverage* is not the
-  gap — what in-process fuzzing would buy is many more *inputs per covered
-  branch*. Worth doing, but it is now a search for a deep input-dependent bug in
-  code that has been fully traversed, not for unexplored territory.
-* **Concurrency.** Everything so far was single-connection. The pre-auth path
-  touches shared state — `acl_cache->lock`, the host-error counters, the
-  password-error counters in §4.7 — and §4.8 is an index/lifetime bug that only
-  shows up under concurrent ACL change. Worth driving many simultaneous
-  pre-auth connections under ASAN with thread sanitiser as a second build.
+* **Out-of-bounds reads as a class**, enumerated the way writes and indirect
+  calls were, over the same measured set. This is the one memory-safety class
+  not yet closed mechanically.
 * **Re-pin `mariadb:latest` before any submission.**
+
 ## 7. Tooling in this directory
 
 * `mariadb_preauth.py` — byte-level pre-auth protocol client. Exposes every
@@ -1126,6 +1469,22 @@ What is still outstanding, in order of expected value:
   first use of each collation id, which is what an unauthenticated client picks.
 * `drive_inprocess_fuzz.py` — §4.19: seed supplier for the in-process re-parse
   hook; keeps every packet inside the hook's size window so it always engages.
+* `writes_all.py` — §4.17: enumerates every memory-writing call site across the
+  *measured* pre-auth function set, so the result does not depend on a call
+  graph written by hand.
+  `python3 -I writes_all.py cov-preauth-only.txt <source-root>`
+  → 46 functions, 127 call sites.
+* `indirect.py` — §4.22: the control-flow dual of the above. Streams
+  `objdump -d -C` over the server binary, keeps the measured pre-auth functions
+  and classifies every indirect `call`/`jmp` by operand (register, memory, GOT),
+  so no site can hide behind a macro, a template or virtual dispatch.
+  `python3 -I indirect.py cov-preauth-only.txt <build>/sql/mariadbd`
+  → 1,809 register / 73 memory / 0 GOT. Deduplicate to source locations with
+  `addr2line -e <binary> -C -s`.
+* `probe_status.py` — §4.20: minimal authenticated client over the unix socket
+  (native_password by hand), used to read MariaDB's own byte-exact
+  `Memory_used` accounting, which RSS cannot substitute for on an ASAN build.
+  `python3 -I probe_status.py <datadir>/m.sock '<password>'`
 
 ### Reproducing
 
