@@ -2188,6 +2188,124 @@ about heap layout rather than about the protocol, the payoff is a read whose
 value is discarded, and the ceiling is a crash. Recorded as open, and not
 chased further on that basis.
 
+### 4.33 ThreadSanitizer: the last mechanical tool, and what it says
+
+§4.18 and §4.16 attacked concurrency by reasoning plus barrier-synchronised
+PoCs, and an earlier §6 listed "drive the pre-auth path under a thread
+sanitiser" as outstanding. It stayed outstanding because it was the one
+avenue that could still produce a *write*: a pre-auth race in which two threads
+write the same memory is a write primitive, and neither §4.17's enumeration nor
+§4.22's would see it.
+
+#### MariaDB 13.0.2 does not build usable under GCC's TSAN
+
+`-DWITH_TSAN=ON` links, but the binary segfaults before printing anything, even
+for `--version`, with no TSAN diagnostic at all. The backtrace places it in the
+dynamic loader:
+
+```
+#1 FVector::alloc_size(unsigned long) [clone .resolver]  sql/vector_mhnsw.cc:494
+#2 elf_machine_rela (skip_ifunc=..., reloc_addr_arg=... <*ABS*@got.plt>)
+#4 _dl_relocate_object
+#5 dl_main
+```
+
+`sql/bloom_filters.h` defines function-multiversioning macros —
+`__attribute__((target("default")))`, `target("avx2,avx,fma")`,
+`target("avx512f,avx512bw")` — and `vector_mhnsw.cc` uses them on the `FVector`
+helpers. GCC emits an ifunc with a generated `.resolver`, instruments that
+resolver like any other function, and the loader calls it during relocation —
+before `__tsan_init` has run. So the first instrumented instruction jumps
+through an uninitialised runtime pointer and the process dies before it can
+report why.
+
+Worth reporting upstream on its own: a resolver must not be sanitizer-instrumented.
+For this work the fix is one file:
+
+```cmake
+IF(WITH_TSAN)
+  SET_SOURCE_FILES_PROPERTIES(vector_mhnsw.cc PROPERTIES COMPILE_OPTIONS "-fno-sanitize=thread")
+ENDIF()
+```
+
+The vector/HNSW code is post-auth and outside this scope, so losing race
+detection inside that one file costs nothing here. After that the server runs —
+with one more adjustment, because TSAN's shadow mappings leave too little
+address space for InnoDB's default 8 TB `innodb_buffer_pool_size_max`
+reservation (`InnoDB: Cannot map innodb_buffer_pool_size_max=8388608m`), so the
+research server passes `--innodb-buffer-pool-size-max=256M`. Also orthogonal to
+the protocol path.
+
+#### Every race, triaged
+
+16 threads of mixed pre-auth traffic, 13,113 rounds: **39 reports.** Grouped by
+the memory they touch, which is what decides whether any of them is a primitive:
+
+| location | reports | what it is |
+|---|---|---|
+| `sql_rand` (32 B) | 11 | the global RNG, raced once per `THD` construction |
+| `my_collation_statistics` (32 KB) | 7 | `use_count++`, one counter per collation id |
+| heap blocks of 204,800 and 336 B | 6 | InnoDB AIO and `tpool` — `IORequest::read_complete`, `os_aio`, `io_slots`, `buf_load` from the buffer-pool dump/load |
+| `ssl_acceptor_stats` (88 B) | 4 | TLS accept counters |
+| `innodb_counter_value` (18 KB) | 3 | InnoDB statistics |
+| `aborted_connects`, `aborted_connects_preauth` (8 B each) | 4 | connection counters |
+| `global_status_var` (2,160 B) | 1 | status counters |
+| **`my_charset_euckr_korean_ci` (200 B)** | 1 | a `CHARSET_INFO` struct — §4.16 |
+
+**Not one race is on a pointer or a buffer.** Everything is a counter, the
+global RNG, or InnoDB's own AIO bookkeeping. There is no write primitive here.
+
+The `my_rnd` races are deliberate, and the code says so:
+
+```c
+  NOTE:
+    This is codes so that it can be called by two threads at the same time
+    with minimum impact.
+    (As the number is supposed to be random, it doesn't matter much if
+    rand->seed1 or rand->seed2 are updated with slightly wrong numbers or
+    if two threads gets the same number.
+```
+
+And they are not the scramble: `thd_create_random_password()` draws from
+`&thd->rand`, which is per-`THD`. The raced `sql_rand` is read once in
+`THD::THD()` to seed that per-THD generator, and the seed also mixes in
+`(ulong)(intptr) this`, so two connections racing on `sql_rand` still get
+different seeds.
+
+#### §4.16 confirmed empirically
+
+The one struct race is exactly §4.16, which until now was a reading of the code:
+
+```
+  Write of size 4 (mutexes: write M0):
+    #0 get_internal_charset            mysys/charset.c:914
+    #2 thd_init_client_charset(THD*, unsigned int)  sql/sql_connect.cc:865
+    #3 parse_client_handshake_packet    sql/sql_acl.cc:14612
+
+  Previous read, no mutex held:
+    #2 my_charset_get_by_name          mysys/charset.c:1014
+    #3 get_charset_by_csname           mysys/charset.c:1033
+    #4 send_server_handshake_packet     sql/sql_acl.cc:13920
+
+  Location is global 'my_charset_euckr_korean_ci' of size 200
+```
+
+The write is at offset 12 of the struct, which in `charset_info_st`
+(`number`, `primary_number`, `binary_number`, `state`) is `state` — so this is
+`cs->state|= MY_CS_READY` under `THR_LOCK_charset` racing the unsynchronised
+`cs->state` test, precisely as §4.16 described, and driven by the collation id
+byte of one connection's handshake.
+
+Two things it adds. The racing *reader* is on a path §4.16 did not name: another
+connection's **greeting generation**, through `get_charset_by_csname()` in
+`send_server_handshake_packet()`. And the raced field is a `uint`, not a
+function pointer — so it is not the control-flow primitive §4.22 could not find.
+A reader either observes the flag set, and on x86-64's store order every prior
+store to the struct with it, or does not and takes the mutex.
+
+So the concurrency line is closed the same way the others were: mechanically,
+and negative.
+
 ## 5. What an auth bypass would actually buy on this target
 
 Worth knowing before spending effort on one, since a bypass to `root@%`
@@ -2385,6 +2503,16 @@ Done:
   recycled every 30,000 connections. No sanitizer report.
 * the pre-auth memory question settled at byte level (§4.20) ✔ — and the
   weaker RSS-based claim in §4.18 withdrawn
+* concurrency closed mechanically, not by reasoning (§4.33) ✔ — the one avenue
+  left that could still produce a *write*, since a pre-auth race in which two
+  threads write the same memory is a primitive neither §4.17 nor §4.22 would
+  see. MariaDB 13.0.2 does not build usable under GCC's TSAN (an instrumented
+  ifunc resolver from `bloom_filters.h`'s multiversioning macros runs before
+  `__tsan_init` and segfaults in the loader); with that fixed, 39 race reports
+  over 13,113 pre-auth rounds, and **not one on a pointer or a buffer** — all
+  counters, the deliberately-unlocked global RNG, or InnoDB's AIO bookkeeping.
+  §4.16's charset race is confirmed empirically, on `CHARSET_INFO::state`, a
+  `uint`
 * out-of-bounds reads attacked directly (§4.24–§4.27) ✔ — the research build
   poisons the unused tail of `net->buff`, which is what made §4.2/§4.3-shaped
   over-reads visible at all: they land inside a valid 16 KB allocation, so
@@ -2414,6 +2542,10 @@ Known limits of these results, stated rather than left implicit:
   sites), but the release build's devirtualisation was not separately checked.
 
 What is still outstanding, in order of expected value:
+* **Longer TSAN exposure.** 13,113 rounds is a start, not a sweep; a rarer race
+  on something other than a counter is the one shape that would still change the
+  conclusion. A 6-round campaign of 32 threads × 600 s plus the collation race
+  is running.
 * **Can the memory after `net->buff` be groomed?** This is what separates
   §4.25 from a remote crash. The 8-byte slack is unreachable through the
   protocol, so it would have to be heap layout: a freed block of the same size
