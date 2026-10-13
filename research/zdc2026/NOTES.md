@@ -2011,14 +2011,14 @@ them, and no longer depends on my differential's blind spot.
 #### The 449 that are reachable and were never executed
 
 Attributed to a file through the debug build's line info, every bucket has a
-reason, and all but one are closed by the target's own configuration:
+reason, and every one is unreachable by an unauthenticated client:
 
 | bucket | functions | why it never ran |
 |---|---|---|
 | `pfs_*.cc`, `pfs.cc` | 32 | `performance_schema` is off |
 | `sql_cache.cc` | 35 | query cache off by default, and post-auth |
 | `debug_sync.cc`, `dbug.c` | 34 | debug build only, not in the release the target runs |
-| `xml.c`, `ctype.c` | 25 | the charset XML loader — see below |
+| `xml.c`, `ctype.c` | 25 | charset XML loader: startup-only behind `my_pthread_once`, and the per-charset branch is dead because all 36 charsets Index.xml declares are compiled in — see below |
 | `dtoa.c`, `my_vsnprintf.c` | 25 | float and other conversions no pre-auth template uses |
 | `hostname.cc` | 8 | `skip_name_resolve=ON` (§2) |
 | `sql_db.cc` | 7 | post-auth |
@@ -2031,10 +2031,10 @@ reason, and all but one are closed by the target's own configuration:
 (269 of the 449 attribute to a file; the rest are template instantiations and
 inlined helpers `nm` does not place.)
 
-#### The one bucket that is not config-closed — and a fidelity gap in my build
+#### The last bucket, and a correction: it is closed too
 
-`xml.c` / `ctype.c` is the `Index.xml` charset loader, and it *is*
-attacker-triggerable: `get_internal_charset()` enters
+`xml.c` / `ctype.c` is the `Index.xml` charset loader. I first wrote this up as
+attacker-triggerable, reasoning that `get_internal_charset()` enters
 
 ```c
     if (!(cs->state & (MY_CS_COMPILED|MY_CS_LOADED)))  /* if CS is not in memory */
@@ -2044,25 +2044,39 @@ attacker-triggerable: `get_internal_charset()` enters
     }
 ```
 
-for any collation id whose charset is not compiled into the binary — and the
-collation id is byte 8 of the handshake response. §4.13 confirmed by direct
-query that **gb18030 is not compiled into the official image**, so on the target
-those ids reach this branch, open a file and run an XML parse before
-authentication.
+for any collation id whose charset is not compiled in, and that §4.13 had shown
+gb18030 missing from the official image. **Both halves of that were wrong**, and
+the conclusion with them.
 
-My instrumented build is built with the default charset set, which compiles
-*more* charsets in than the official package ships, so that branch never
-executes in any of my tests — which is precisely why 25 loader functions show
-up as reachable-but-never-executed. That is a fidelity gap between my build and
-the target, and I had not noticed it.
+There is no `ctype-gb18030.c` anywhere in the 13.0.2 tree and nothing under
+`strings/` or `include/` mentions gb18030: it is a MySQL charset MariaDB does
+not implement. So "not compiled into the official image" is true but says
+nothing about the package's charset set — §4.13 was right to drop gb18030 from
+scope, and I was wrong to build an argument about build fidelity on top of it.
 
-What it is worth: the attacker chooses *whether* the loader runs, not what it
-parses. The filename is `charsets_dir` plus a compiled-in `cs_name`, and the
-file content is server-owned, so no wire data enters `my_xml_parse`. The
-exposure is a pre-auth file open and XML parse on demand, not attacker-supplied
-input to a parser. Recorded rather than chased for that reason, and because
-closing it properly means rebuilding with the package's exact
-`-DWITH_CHARSETS` set.
+The branch is dead on this target in any case. The image ships one charset
+file, `/usr/share/mariadb/charsets/Index.xml`, declaring 36 charsets, and every
+one of the 36 has a `ctype-*.c` implementation in the source — nothing is
+declared but not compiled. Every collation id that resolves at all resolves to
+a compiled charset, so `!(MY_CS_COMPILED|MY_CS_LOADED)` is never true.
+
+The loader does run, but at startup rather than on demand:
+`init_available_charsets()` calls `init_compiled_charsets()` and then reads
+Index.xml unconditionally, behind
+`my_pthread_once(&charsets_initialized, init_available_charsets)` — once per
+process, triggered by server initialisation long before any client connects,
+with a fixed server-owned file as input.
+
+So why were those 25 functions never executed here? Because my build tree has
+no `share/charsets/` directory at all: `my_read_charset_file()` cannot open the
+file and returns, so `my_xml_parse()` never runs. That is the real difference
+between my build and the target, it is nothing like the charset-set gap I
+claimed, and it changes nothing pre-auth — on the target the same code parses
+the same server-owned file once at startup.
+
+**So every one of the 449 is accounted for and none is attacker-reachable** —
+this bucket by the `once` guard and the compiled-charset set, the rest by the
+target's configuration.
 
 ### 4.31 The §4.25 bug class, hunted on purpose instead of by accident
 
@@ -2252,7 +2266,7 @@ rather than a hand-written call graph, are the central results:
   enumerations over the corrected union of 621 confirms both results instead of
   overturning them. The numbers above are the corrected ones. The 449 reachable
   functions that were never executed are accounted for bucket by bucket, all
-  but one closed by the target's own configuration.
+  every one of them unreachable by an unauthenticated client.
 
 A memory-corruption RCE needs one or the other. Neither exists in this path.
 And §5.1 closes the remaining route — a bypass followed by post-auth execution
