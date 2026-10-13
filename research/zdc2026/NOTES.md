@@ -455,6 +455,126 @@ competition counts.
   parsing refactor in §4.6, the pre-auth path has not changed — so "new code in
   13.0" is not a useful way in; this is mature, long-fuzzed code.
 
+### 4.11 `prepare_hostname_cache_key()` — pre-auth `memcpy` bounded only by a `DBUG_ASSERT`
+
+`sql/hostname.cc:178`:
+
+```c
+static void prepare_hostname_cache_key(const char *ip_string, char *ip_key)
+{
+  size_t ip_string_length= strlen(ip_string);
+  DBUG_ASSERT(ip_string_length < HOST_ENTRY_KEY_SIZE);
+
+  memset(ip_key, 0, HOST_ENTRY_KEY_SIZE);
+  memcpy(ip_key, ip_string, ip_string_length);
+}
+```
+
+`HOST_ENTRY_KEY_SIZE` is `INET6_ADDRSTRLEN`, i.e. **46**, the callers pass a
+`char ip_key[HOST_ENTRY_KEY_SIZE]` on the stack, and the length of `ip_string`
+is never checked outside that assert — which is compiled out of a release
+build, and the official image is a release build.
+
+**This is reachable before authentication.** `inc_host_errors(thd->security_ctx->ip,
+&errors)` runs on every failed login, from `acl_authenticate()`'s error block
+and from the `check_require_secured_transport()` path in
+`parse_client_handshake_packet()`, and it calls
+`prepare_hostname_cache_key()` directly. `skip-name-resolve` and
+`host-cache-size=0` do **not** turn it off: `hostname_cache_init()`
+unconditionally does `new Hash_filo<Host_entry>(..., host_cache_size, ...)`, so
+the cache object exists at size 0 and the lookup path still runs. The third
+caller, in `ip_to_hostname()`, is the one `skip-name-resolve` skips.
+
+Can `ip_string` exceed 45 characters? `thd->main_security_ctx.ip` is only ever
+assigned at `sql_connect.cc:978`, `my_strdup(ip)`, where `ip` comes from
+`vio_peer_addr()`:
+
+```c
+    err_code= vio_getnameinfo((struct sockaddr *) &vio->remote,
+                              ip_buffer, ip_buffer_size,
+                              port_buffer, NI_MAXSERV,
+                              NI_NUMERICHOST | NI_NUMERICSERV);
+```
+
+`ip_buffer` is `check_connection()`'s `char ip[NI_MAXHOST]` (1025), so
+`vio_getnameinfo()` itself has room. The problem is what it may produce:
+for a **scoped** IPv6 source address glibc's `getnameinfo()` appends
+`%<interface>` to the numeric form. `vio_get_normalized_ip()` only rewrites
+IPv4-mapped and IPv4-compatible addresses; a native IPv6 address takes
+
+```c
+      /* This is a "native" IPv6 address. */
+      memcpy(dst, src, src_length);
+```
+
+which preserves `sin6_scope_id`. A link-local peer such as
+`fe80:ffff:ffff:ffff:ffff:ffff:ffff:ffff%<ifname>` is 39 characters of address
+plus `%` plus up to 15 (`IFNAMSIZ - 1`) — up to 55 — so `strlen(ip_string)` can
+exceed the 46-byte destination and overflow the caller's stack frame by up to
+nine bytes. The comment above `vio_get_normalized_ip_string()` in the same file
+states the assumption that breaks here: "The system constant INET6_ADDRSTRLEN
+can be used to reserve buffers of the right size."
+
+**Not reachable on the ZeroDay Cloud target.** The container has no IPv6 at all
+— `/proc/net/if_inet6` does not exist inside it and the server logs
+`Failed to create a socket for IPv6 '::': errno: 97` (EAFNOSUPPORT) on every
+start — so every peer address is an IPv4 dotted quad of at most 15 characters.
+Triggering it needs an IPv6-enabled host, an attacker on the same link so the
+source address is link-local, and an interface name long enough to push address
+plus scope past 45 characters.
+
+This is the only pre-auth **write** found whose sole bound is a compiled-out
+assert, so it is the one worth reporting upstream even though it does not help
+here.
+
+### 4.12 Paths audited in the source-audit round and found sound
+
+* **`err_conv()` / `ErrBuff::set_str()` / `set_strq()`** (`sql/sql_error.cc:935`,
+  `sql/sql_error.h:875`). Reachable pre-auth with attacker bytes: the §4.3 PoC
+  shows `ER_INVALID_CHARACTER_STRING` firing on the database field, which builds
+  an `ErrConvString(src, src_length, &my_charset_bin)` out of up to 16 MB of
+  client data into a 512-byte `err_buffer`. The binary branch keeps the
+  invariant `to == buff + res`, checks `res + 4 >= to_length` before each
+  five-byte `\xNN` escape, and `set_strq()`'s `err_buffer[len+2]= 0` lands on
+  index 511 at worst — it fits exactly.
+* **`send_server_handshake_packet()`**. `buff` is `my_alloca`'d *before*
+  `data_len` is raised to `SCRAMBLE_LENGTH`, which is a latent sizing hazard,
+  but the 64-byte constant absorbs it: with `SERVER_VERSION_LENGTH` 60, a
+  22-character `server_version` and a 21-character `client_auth_plugin` the
+  slack is 58 bytes. The `data_len == 0` entry needs an auth plugin that reads
+  before writing, and the default plugin always writes first —
+  `default_auth_plugin_name` is initialised to `mysql_native_password` and never
+  reassigned anywhere in `sql/`. Also worth noting for §4.5:
+  `cached_server_packet.pkt` is a `thd->memdup()` copy, **not** a pointer into
+  `net->buff`.
+* **`net_send_error_packet()`** (`sql/protocol.cc:411`). `buff` is
+  `2+1+SQLSTATE_LENGTH+MYSQL_ERRMSG_SIZE` = 520 bytes; with `CLIENT_PROTOCOL_41`
+  `pos` is `buff+8` and `strmake(pos, converted_err, MYSQL_ERRMSG_SIZE-1)`
+  writes through index 519 at worst — exactly in bounds. The message itself is
+  pre-truncated by `convert_error_message()` into a 512-byte buffer, and the
+  error templates bound their arguments with precision specifiers
+  (`ER_ACCESS_DENIED_ERROR` is `'%-.48s'@'%-.64s'`).
+* **`ignore_max_password_errors()`** would `strcasecmp()` the account's
+  `host.hostname` directly, which is a NULL dereference under the MySQL
+  convention where a `%` host is stored as NULL. MariaDB's `update_hostname()`
+  substitutes `host_not_specified` instead and the comment says so — "This will
+  not be modified!" — so the pointer is never NULL. Independently, its caller is
+  guarded by `password_errors >= max_password_errors` and `max_password_errors`
+  is `DEFAULT(UINT_MAX)` with `VALID_RANGE(1, UINT_MAX)`, so reaching it would
+  take 2^32 failed attempts.
+* **`check_connection()` / `thd_set_peer_addr()` / `vio_peer_addr()`**. Every
+  buffer write carries its size (`ip[NI_MAXHOST]` into `vio_getnameinfo`,
+  `ip_string[128]` into `inet_ntop`), and with `skip_name_resolve` the whole
+  `ip_to_hostname()` block is skipped, so `sctx->host` stays NULL for a TCP
+  connection — which is the concrete reason a `localhost`-only account such as
+  `mariadb.sys` cannot be matched by name from the network (§4.7).
+* **`compare_hostname()` / `find_by_username_or_anon()`**. Both NULL-safe for
+  `host == NULL`; the wildcard *pattern* comes from the ACL row, not from the
+  client, so the recursive `wild_compare()` matcher is not attacker-driven, and
+  the lookup loop is bounded by `acl_users.elements`.
+* **`my_real_read()`'s out-of-order path**, **`handle_password_errors()`** and
+  **`vio/viossl.c`** — see §4.10.
+
 ## 5. What an auth bypass would actually buy on this target
 
 Worth knowing before spending effort on one, since a bypass to `root@%`
@@ -480,17 +600,21 @@ authentication bypass.** Specifically:
 
 * every out-of-bounds access found (§4.2, §4.3) is a *read* that provably stays
   inside the `net->buff` allocation on this target;
-* the two write-shaped bugs found (§4.8, and §4.5's stale cached pointer) both
-  need something an unauthenticated client cannot cause — a concurrent
-  `ALTER USER`, or an account with more than one authentication method;
+* the three write-shaped bugs found all need something an unauthenticated client
+  cannot cause on this target — a concurrent `ALTER USER` (§4.8), an account with
+  more than one authentication method (§4.5), or an IPv6-capable host and a
+  link-local peer (§4.11);
 * the authentication decision logic (§4.7) is sound, with one latent gap that no
   loaded plugin can reach.
 
 Done:
 * target pinned, configuration and account set read out of the running image ✔
 * pre-auth surface enumerated with the non-reachable parts positively excluded ✔
-* source audit of every reachable path, including the TLS glue, the framing
-  layer and the auth decision logic (§4) ✔
+* source audit of every reachable path (§4): the framing layer, the handshake
+  parser, the TLS glue, the auth decision logic, the connection setup
+  (`check_connection`/`thd_set_peer_addr`/`vio_peer_addr`), the ACL lookup and
+  host matching, the error-formatting path (`err_conv`, `net_send_error_packet`)
+  and the host-error accounting ✔
 * ASAN build of 13.0.2 and targeted PoCs for §4.2 and §4.3 ✔
 * 46,500 randomised pre-auth cases against the ASAN build ✔ — capability-flag
   combinations, charset ids, username/database/plugin-name shapes, all three
