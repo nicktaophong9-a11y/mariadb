@@ -1342,7 +1342,7 @@ ASAN quarantines freed chunks, so the fill-then-scan phase is weaker evidence
 on this build than it would be against stock glibc — but the invariant does
 not care which allocator is underneath.
 
-### 4.25 A pre-auth out-of-bounds read that leaves the heap block — one root cause, three branches
+### 4.25 A pre-auth out-of-bounds read that leaves the heap block — one root cause, four branches
 
 This is the first memory-safety defect found here that actually crosses an
 allocation boundary, and it is reached from a single unauthenticated packet on
@@ -1405,6 +1405,65 @@ to `SIZE_MAX`. Every internal `if (packet_len < N) goto err` then passes, so the
 0xFE case runs `(*packet)+=9; return uint8korr(pos+1);` with no bound at all —
 `uint8korr` reads `pos[1..8]`, ending at `buff + max_packet + 9` while the last
 valid byte is `buff + max_packet + 7`. **Two bytes past the end of the block.**
+
+#### A fourth consumer, on the capability set every real client sends
+
+`passwd` is not the only pointer the guard fails to bound. Immediately after it:
+
+```c
+  if (passwd == NULL ||
+      passwd + passwd_len + MY_TEST(db) > (char*) net->read_pos + pkt_len)
+    return packet_error;                 /* bounds passwd + passwd_len + 1 */
+
+  /* strlen() can't be easily deleted without changing protocol */
+  db_len= safe_strlen(db);               /* db is inside, so db + db_len can
+                                            reach read_pos + pkt_len exactly */
+
+  char *next_field= passwd + passwd_len + (db ? db_len + 1 : 0);
+  Lex_ident_plugin client_plugin= Lex_cstring_strlen(next_field);   /* :14598 */
+```
+
+The guard accounts for `passwd_len` but **not for `db_len`**. `db` is inside the
+packet, so `safe_strlen(db)` stops at the packet terminator at worst, which puts
+`db + db_len` at `read_pos + pkt_len` and `next_field` at
+`read_pos + pkt_len + 1` — outside again, and `Lex_cstring_strlen` is a plain
+`strlen`, so the scan is **unbounded**.
+
+This is the most serious of the four, because it needs no legacy or exotic
+capability: `CLIENT_SECURE_CONNECTION | CLIENT_CONNECT_WITH_DB |
+CLIENT_PLUGIN_AUTH` is what every real client sends. Under the adversarial heap:
+
+```
+nextfield -> AddressSanitizer: heap-buffer-overflow
+             READ of size 8 at 0x5290000ef228
+             0x5290000ef228 is located 0 bytes after 16424-byte region
+             #0 strlen
+             #1 Lex_cstring_strlen::Lex_cstring_strlen(char const*) sql/lex_string.h:140
+             #2 parse_client_handshake_packet sql_acl.cc:14598
+```
+
+and clean on a stock heap over 400 reps, like the others.
+
+The bound for it **exists and is correct** — it is just evaluated after the scan
+that needs it:
+
+```c
+  if ((thd->client_capabilities & CLIENT_PLUGIN_AUTH) &&
+      (client_plugin.str < (char *)net->read_pos + pkt_len))     /* :14658 */
+    next_field+= strlen(next_field) + 1;
+  else
+  {
+    /* Some clients lie. Sad, but true */
+    thd->client_capabilities &= ~CLIENT_PLUGIN_AUTH;
+    ...
+    client_plugin= native_password_plugin_name;        /* the bad value is replaced */
+  }
+```
+
+So the out-of-packet plugin name never reaches `cached_client_reply.plugin` or
+the plugin comparison: `:14658` catches exactly the case `:14598` creates and
+substitutes a server-side constant. Nothing between the two uses
+`client_plugin`. The over-read happens; its result is thrown away.
 
 The same file already has the correct pattern, 400 lines earlier and also
 pre-auth, in `read_client_connect_attrs()`:
@@ -1474,6 +1533,9 @@ survived, no report.**
   rejected with `packet_error`. There is no path from the bytes read to
   anything the client observes, so not even an information leak.
 * It is a **read**, and §4.17 shows there is no write primitive to pair it with.
+* The fourth branch's value is discarded too, by the existing `:14658` check —
+  which is why this is an over-read and not a pre-auth heap disclosure, even
+  though the plugin name would otherwise flow into `cached_client_reply`.
 * Reaching past the block needs the memory after `net->buff` to contain no
   zero byte (and, for `lenenc`, a 0xFE at `buff + max_packet + 1`). Those bytes
   are not attacker-supplied through the protocol: no packet write ever reaches
@@ -1504,8 +1566,10 @@ about memory past `buff_end`, which is where these reports land.
 
 #### Fix
 
-One line, mirroring `read_client_connect_attrs()`, placed right after
-`passwd` is computed, bounding all three branches at once:
+Two checks, not one. I first wrote this up as a single line bounding `passwd`,
+which is wrong: it covers the first three branches but **not** the fourth,
+where `passwd` is legitimately inside the packet and it is `next_field` that
+escapes.
 
 ```c
    char *passwd= strend(user)+1;
@@ -1513,8 +1577,22 @@ One line, mirroring `read_client_connect_attrs()`, placed right after
 +    return packet_error;
 ```
 
-This rejects nothing that is accepted today: the existing guard already fails
-every packet that reaches it with `passwd` past the end.
+bounds the `strlen` / `len1` / `lenenc` branches at once, mirroring
+`read_client_connect_attrs()`. And for the fourth, hoisting the check that
+already exists at `:14658` above the scan at `:14598`:
+
+```c
+   char *next_field= passwd + passwd_len + (db ? db_len + 1 : 0);
++  if (next_field > (char*) net->read_pos + pkt_len)
++    return packet_error;
+   Lex_ident_plugin client_plugin= Lex_cstring_strlen(next_field);
+```
+
+Neither rejects anything that is accepted today. For the first, the existing
+guard already fails every packet that reaches it with `passwd` past the end;
+for the second, `:14658` already discards the value. `next_field ==
+read_pos + pkt_len` must stay legal — that is the terminator's own position,
+giving an empty plugin name — which is why the comparison is `>` and not `>=`.
 
 ## 5. What an auth bypass would actually buy on this target
 
@@ -1788,7 +1866,7 @@ What is still outstanding, in order of expected value:
 * `poc_lenenc_bound.py` — §4.25: the length-encoded branch, where the bound
   handed to `safe_net_field_length_ll()` goes negative and converts to
   `SIZE_MAX`.
-* `poc_passwd_past_end.py` — §4.25: all three branches of the one root cause,
+* `poc_passwd_past_end.py` — §4.25: all four branches of the one root cause,
   against a packet sized so the slack past `buff_end` is at its 8-byte minimum.
   Run the server with `ASAN_OPTIONS=malloc_fill_byte=254:max_malloc_fill_size=65536`
   to make the heap adversarial.
