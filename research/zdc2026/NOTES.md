@@ -1594,6 +1594,179 @@ for the second, `:14658` already discards the value. `next_field ==
 read_pos + pkt_len` must stay legal — that is the terminator's own position,
 giving an empty plugin name — which is why the comparison is `>` and not `>=`.
 
+Both checks are applied in the research build and verified to silence all four
+branches; see §4.26.
+
+### 4.26 The poisoning moved onto the network path, and the fix validated against it
+
+§4.24's poisoning only ran inside the hook, which limits it twice over: the hook
+parses from accumulated mutated state (§4.21), and it clears `CLIENT_SSL` and
+`CLIENT_PLUGIN_AUTH` out of every packet, so the post-TLS re-read branch — §4.2's
+own path — and the auth-switch branch were the two places the poisoning could
+never reach.
+
+Extending it to the network parse means handling the ~20 `return packet_error`
+paths of `parse_client_handshake_packet()` without leaving the buffer poisoned
+behind, so it is a scope guard rather than scattered unpoison calls:
+
+```cpp
+class Preauth_tail_poison
+{
+  NET *m_net;
+public:
+  Preauth_tail_poison(NET *net, ulong len) : m_net(net)
+  { preauth_poison_tail(net, len); }
+  void lift() { preauth_unpoison_buffer(m_net); }
+  ~Preauth_tail_poison() { preauth_unpoison_buffer(m_net); }
+};
+```
+
+It is instantiated **after** the `CLIENT_SSL` / `check_require_secured_transport`
+chain, where `pkt_len` is final for both the plain and the post-TLS path, so one
+object covers the whole rest of the parse — the post-TLS branch included —
+without needing to re-poison around the nested read. `lift()` is then needed at
+exactly one place, the auth-switch round trip, which writes and reads
+`net->buff` for real:
+
+```c
+  if (client_auth_plugin &&
+      !client_plugin.streq(Lex_cstring_strlen(client_auth_plugin)))
+  {
+    tail_poison.lift();
+    ...
+    if (send_plugin_request_packet(...)) return packet_error;
+    passwd_len= my_net_read(&thd->net);
+```
+
+Nothing else in that scope writes into the tail: `my_error()` only fills the
+diagnostics area, and the error packet is not written to `net->buff` until after
+the parse has returned and the guard has lifted.
+
+#### What this buys: detection on a stock heap
+
+§4.25 needed `malloc_fill_byte=254` to see anything, because on a stock heap the
+over-reads land in valid memory. With the slack poisoned they are reported
+regardless of what the heap holds:
+
+```
+nextfield -> use-after-poison, sql_acl.cc:14658   (stock heap, 512-byte packet)
+strlen    -> use-after-poison, sql_acl.cc:14627   (stock heap, 512-byte packet)
+```
+
+The other two are silent at that length for a reason worth recording, because it
+is the detector's resolution rather than their absence: ASAN poisons whole
+8-byte granules, so `preauth_poison_tail()` rounds the start up and the first
+`(8 - (pkt_len + 1) % 8) % 8` bytes past the packet stay addressable. `len1`
+reads exactly one byte there and falls in that gap; `lenenc` reads one byte too
+unless the heap hands it 0xFE. Choosing `pkt_len ≡ 7 (mod 8)` puts the poison
+boundary exactly at `pkt_len + 1`, which is why 511 is in the test set
+alongside 512 and 16384.
+
+#### The proposed fix, validated
+
+The two checks §4.25 proposes are now applied in the research build, behind
+`MARIADB_PREAUTH_FUZZ_HOOK`, both so they can be tested and so the four known
+sites stop masking everything else. Against the poisoned network path, all four
+branches go clean at all three lengths:
+
+```
+nextfield -> clean (511/512/16384)
+strlen    -> clean (511/512/16384)
+lenenc    -> clean (511/512/16384)
+len1      -> clean (511/512/16384)
+```
+
+So the fix is complete for this root cause, not merely plausible — which is
+also what justifies my correcting the single-check version I first wrote down.
+
+With the bug patched in the instrumented build, the whole battery was re-run
+under the new detection regime: 20,000 randomised cases, the four targeted PoC
+groups, the coverage-gap shapes, the post-TLS short packets, the slack-scan
+pairs, 32-thread concurrency and the collation race. Every one of these had been
+run before, but never with the memory past the packet poisoned, so an over-read
+that stays inside `net->buff` is now a report instead of silence.
+
+### 4.27 §4.2 confirmed: the post-TLS re-read does read out of the packet
+
+With the poisoning on the network path and §4.25 fixed in the research build,
+the randomised driver produced a report at iteration 250 of 20,000 — so this is
+not a corner the fuzzer struggles to reach:
+
+```
+==7494==ERROR: AddressSanitizer: use-after-poison
+    #0 parse_client_handshake_packet  sql/sql_acl.cc:14579
+    #1 server_mpvio_read_packet       sql/sql_acl.cc:15035
+    #2 native_password_authenticate   sql/sql_acl.cc:15678
+    #3 do_auth_once                   sql/sql_acl.cc:15227
+    #4 acl_authenticate               sql/sql_acl.cc:15356
+    #5 check_connection               sql/sql_connect.cc:1184
+```
+
+`:14579` is `thd_init_client_charset(thd, (uint) net->read_pos[8])`, with
+`uint4korr(net->read_pos+4)` on the line above it. The structure is what makes
+it reachable:
+
+```c
+  if (pkt_len < MIN_HANDSHAKE_SIZE)            /* 6 */
+    return packet_error;
+  ulonglong client_capabilities= uint2korr(net->read_pos);
+  if (client_capabilities & CLIENT_PROTOCOL_41)
+  {
+    if (pkt_len < 32)                          /* the 32-byte check, first read only */
+      return packet_error;
+    ...
+  }
+  if (thd->client_capabilities & CLIENT_SSL)
+  {
+    ...
+    pkt_len= my_net_read(net);                 /* pkt_len replaced */
+    if (unlikely(pkt_len == packet_error || pkt_len < NORMAL_HANDSHAKE_SIZE))
+      return packet_error;                     /* NORMAL_HANDSHAKE_SIZE is 6 */
+  }
+  ...
+  if (client_capabilities & CLIENT_PROTOCOL_41)      /* caps from the FIRST packet */
+  {
+    thd->max_client_packet_length= uint4korr(net->read_pos+4);   /* offsets 4..7 */
+    if (thd_init_client_charset(thd, (uint) net->read_pos[8]))   /* offset 8 */
+    end= (char*) net->read_pos+32;
+  }
+```
+
+`client_capabilities` is parsed from the pre-TLS packet and still says
+`CLIENT_PROTOCOL_41`, but `pkt_len` now belongs to the post-TLS packet and has
+only been checked against 6. So offsets 4..8 are read out of a packet that can
+be 6 bytes long, and `end` is set to `read_pos + 32` regardless.
+
+This is **§4.2**, which recorded the missing 32-byte minimum but could only call
+it "reachable, not exploitable" — the over-read itself was never observed,
+because it lands inside `net->buff` where ASAN cannot see it. It is now
+observed.
+
+Consequences, and why it stays bounded: the byte at offset 8 is a collation id,
+so an out-of-packet byte selects the connection charset and drives the lazy
+collation initialisation of §4.16 and the conversion tier of §4.13. Then
+`end = read_pos + 32` meets `if (end >= (char*) net->read_pos + pkt_len + 2)
+return packet_error;`, which rejects every `pkt_len <= 30`. So the charset is
+set from stale buffer memory and the connection is then refused; the read is
+deep inside the 16 KB buffer, never past the allocation. A remote client gets
+no observable difference, and nothing persists.
+
+Fix, mirroring the check the first read already has:
+
+```c
+     pkt_len= my_net_read(net);
++    if ((client_capabilities & CLIENT_PROTOCOL_41) && pkt_len != packet_error &&
++        pkt_len < 32)
++      return packet_error;
+     if (unlikely(pkt_len == packet_error || pkt_len < NORMAL_HANDSHAKE_SIZE))
+       return packet_error;
+```
+
+Applied in the research build and `poc_post_tls_short_packet.py` goes clean,
+so the battery can carry on to whatever is behind it. Both §4.25's and this
+fix are behind `MARIADB_PREAUTH_FUZZ_HOOK` and must not ship — they are there
+to stop known bugs masking unknown ones.
+
 ## 5. What an auth bypass would actually buy on this target
 
 Worth knowing before spending effort on one, since a bypass to `root@%`
@@ -1780,11 +1953,20 @@ Done:
   recycled every 30,000 connections. No sanitizer report.
 * the pre-auth memory question settled at byte level (§4.20) ✔ — and the
   weaker RSS-based claim in §4.18 withdrawn
-* out-of-bounds reads attacked directly (§4.24, §4.25) ✔ — the research build
-  poisons the unused tail of `net->buff` during each re-parse, which is what
-  made §4.2/§4.3-shaped over-reads visible at all; it reproduced §4.3 with a
-  sanitizer stack trace, then found the second and third branches of the same
-  root cause, one of which (§4.25) crosses the allocation boundary
+* out-of-bounds reads attacked directly (§4.24–§4.27) ✔ — the research build
+  poisons the unused tail of `net->buff`, which is what made §4.2/§4.3-shaped
+  over-reads visible at all: they land inside a valid 16 KB allocation, so
+  ASAN cannot see them unaided. It reproduced §4.3 immediately, then found the
+  other three branches of that root cause (§4.25, one of which crosses the
+  allocation boundary), and once the poisoning was moved onto the network
+  path (§4.26) it confirmed §4.2 as well (§4.27). Both of the read findings
+  that §4.2/§4.3 could only call "reachable, not exploitable" are now
+  demonstrated rather than argued.
+* the methodology that produced them: patch each confirmed bug in the research
+  build behind `MARIADB_PREAUTH_FUZZ_HOOK`, verify the PoC goes clean, and
+  re-run the battery so a known bug cannot mask an unknown one. §4.25's fix is
+  validated this way (all four branches clean at three lengths, §4.26) and so
+  is §4.27's.
 
 Known limits of these results, stated rather than left implicit:
 * the in-process campaign parses from **accumulated, mutated state**, not from
