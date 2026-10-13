@@ -155,8 +155,9 @@ class Conn:
         cap_ext = struct.unpack("<I", body[i:i + 4])[0]
         i += 4
         rest = body[i:]
-        scramble2 = rest[:max(0, scramble_len - 9)]
-        plugin = rest[max(0, scramble_len - 9):].split(b"\x00")[0].decode("latin1")
+        n2 = max(0, scramble_len - 9)
+        scramble2 = rest[:n2]
+        plugin = rest[n2 + 1:].split(b"\x00")[0].decode("latin1")
         self.greeting = {
             "server_version": server_version,
             "thread_id": thread_id,
