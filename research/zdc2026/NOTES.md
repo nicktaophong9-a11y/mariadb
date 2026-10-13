@@ -334,39 +334,185 @@ changes — e.g. a deployment installed with
   stack buffers are admin paths (`CREATE USER`, `SET PASSWORD`, ACL load), not
   pre-auth.
 
-## 5. Status
+### 4.7 Authentication decision logic — audited, sound
 
-**No unauthenticated RCE found, and no write primitive identified.** Everything
-in §4.2–4.3 is an out-of-bounds *read* that provably stays inside the
-`net->buff` allocation on this target. §4.5 is a genuine lifetime bug pattern
-that the official account set does not reach.
+The success/failure algebra is easy to misread because of the constant values
+(`include/mysql/plugin_auth_common.h`):
 
-The reachable MariaDB-side pre-auth surface is small and, as far as this audit
-goes, tight. The disproportionately large remaining surface is the TLS handshake
-(§4.4) — reachable only because the server auto-generates a certificate when
-none is configured — which is OpenSSL 3.5.5 code rather than MariaDB code.
+```
+CR_OK                    = -1      CR_ERROR                 =  0
+CR_OK_HANDSHAKE_COMPLETE = -2      CR_AUTH_USER_CREDENTIALS =  1
+                                   CR_AUTH_HANDSHAKE        =  2
+                                   CR_AUTH_PLUGIN_ERROR     =  3
+```
+
+so `acl_authenticate()`'s failure test `if (res > CR_OK && mpvio.status !=
+MPVIO_EXT::SUCCESS)` means "res >= 0", and the two ways past it are a negative
+`res` or `status == SUCCESS`. Both were chased down:
+
+* **`status == SUCCESS`** is assigned at exactly two places in the whole server
+  (`sql_acl.cc:14333` and `:14641`), and both are inside `if (!initialized)`,
+  the `--skip-grant-tables` branch. `initialized` is a file-static that is only
+  ever assigned `1`, in `acl_init()` (`sql_acl.cc:2981`); nothing clears it at
+  runtime, so a failed or reloaded ACL cannot re-open that branch.
+
+* **A negative `res`** means a plugin returned `CR_OK` or
+  `CR_OK_HANDSHAKE_COMPLETE`. Here there *is* a real gap: the safety net
+
+  ```c
+    if (mpvio.make_it_fail && res == CR_OK)
+    { mpvio.status= MPVIO_EXT::FAILURE; res= CR_ERROR; }
+  ```
+
+  only neutralises `CR_OK`. A plugin returning `CR_OK_HANDSHAKE_COMPLETE` (-2)
+  would keep `make_it_fail` from taking effect *and* pass `res > CR_OK`,
+  authenticating a username that matched no account as whichever real ACL row
+  §4.1's hash selected. It is unreachable because **no server-side auth plugin
+  returns -2** — the only producers in the tree are client-side plugins
+  (`auth_dialog/dialog.c`, `auth_examples/*`, `auth_gssapi/{gssapi,sspi}_client.cc`).
+  Worth reporting upstream as hardening, not usable here.
+
+Why `make_it_fail` matters at all: `native_password_authenticate()` returns
+
+```c
+  if (pkt_len == 0) /* no password */
+    DBUG_RETURN(info->auth_string_length != 0 ? CR_AUTH_USER_CREDENTIALS : CR_OK);
+```
+
+so an **empty** auth response authenticates any account whose stored
+`auth_string` is empty — and `mariadb.sys@localhost` on this target has
+`"authentication_string":""`. It cannot be reached by name (its host is
+`localhost`, and with `skip_name_resolve` a remote connection has
+`sctx->host == NULL` and only an IP to match against), but §4.1's hash *can*
+select it for an unknown username. `make_it_fail` is precisely what stops that
+from being an auth bypass.
+
+### 4.8 `set_user_salt_if_needed()` indexes the current ACL row with a stale index
+
+Called pre-auth from the `done:` block of `server_mpvio_read_packet()`:
+
+```c
+  ACL_USER *user= find_user_exact(user_copy->hostname(), user_copy->user);
+  // make sure the user wasn't altered or dropped meanwhile
+  if (user)
+  {
+    ACL_USER::AUTH *auth= user->auth + curr_auth;
+    if (!auth->salt.str && auth->plugin.length == auth_copy->plugin.length && ...)
+      auth->salt= auth_copy->salt;
+```
+
+`curr_auth` comes from the per-connection *copy* of the account. `user` is the
+account as it stands now, and its `nauth` is never re-checked, so if the account
+was altered to have fewer authentication methods between the copy and this
+point, `user->auth + curr_auth` is out of bounds — first read, for the
+`plugin.length`/`auth_string.length` comparison, then written by
+`auth->salt= auth_copy->salt`. The only thing relating `curr_auth` to the array
+is the `DBUG_ASSERT` on entry, which compiles out of a release build.
+
+Not reachable pre-auth: it needs a concurrent `ALTER USER`, which requires
+privileges. Reported here because it is a genuine lifetime/index bug and a
+write, unlike everything else in §4.
+
+### 4.9 Pre-auth memory amplification via the database field
+
+`THD::copy_fix()` sizes its allocation as
+
+```c
+  size_t dst_length= dstcs->mbmaxlen * src_length;
+  if (alloc_lex_string(dst, dst_length + 1)) ...
+```
+
+For the handshake path `dstcs` is `system_charset_info` (utf8mb3, mbmaxlen 3)
+and `src_length` is the database-name length, bounded only by the packet, so one
+unauthenticated connection can force a ~48 MB allocation on its THD mem_root
+from a 16 MB packet. With `max_connections` at its default this is multi-GB of
+memory reachable without credentials. The arithmetic itself cannot overflow on
+64-bit at this bound, and the conversion is correctly limited to `dst_length`,
+so this is a resource issue, not corruption — and a DoS is outside what the
+competition counts.
+
+### 4.10 Paths audited this round and found sound
+
+* **`vio/viossl.c`** (MariaDB's own TLS glue, not OpenSSL). `vio_ssl_read()` and
+  `vio_read()` are declared `size_t` but `return -1` on error, i.e. `SIZE_MAX`.
+  `my_real_read()` guards this correctly with an explicit cast —
+  `if ((ssize_t) length <= 0)` — so `remain -= length` / `pos += length` cannot
+  run away. `ssl_do()`/`ssl_handshake_loop()` keep no state across the
+  handshake, and the peer-certificate printing is inside `#ifndef DBUG_OFF`.
+* **The out-of-order packet path.** Sending a handshake response with a wrong
+  sequence number is enough to reach `my_real_read()`'s `packets_out_of_order`
+  label, which offers the bytes to `handle_proxy_header()` first. Without
+  `proxy_protocol_networks` that returns `IGNORE` (or `ABORT` if the first four
+  bytes match a PROXY signature), and the only path that re-enters the read
+  loop, `RETRY`, is behind `is_proxy_protocol_allowed()`. Fuzzed with both
+  signature families and desynchronised sequence numbers.
+* **`handle_password_errors()`** takes `acl_cache->lock` and asserts it does not
+  already hold it; the lookup is by name and host, not by a cached pointer.
+* **13.0 vs 11.8.4.** Extracting and diffing the individual pre-auth functions
+  shows `send_server_handshake_packet()`, `read_client_connect_attrs()`,
+  `ignore_max_password_errors()` and `check_require_secured_transport()` are
+  **identical** across the two releases. Apart from the password/database
+  parsing refactor in §4.6, the pre-auth path has not changed — so "new code in
+  13.0" is not a useful way in; this is mature, long-fuzzed code.
+
+## 5. What an auth bypass would actually buy on this target
+
+Worth knowing before spending effort on one, since a bypass to `root@%`
+followed by post-auth code execution would count as unauthenticated RCE. On the
+official image the usual post-auth levers are closed (checked against the
+running container):
+
+| lever | state |
+|---|---|
+| `SET GLOBAL wsrep_provider='/path/evil.so'` (dlopen) | `ERROR 1238 ... read only variable` |
+| `SET GLOBAL wsrep_notify_cmd='...'` (command exec) | `ERROR 1238 ... read only variable` |
+| `CREATE FUNCTION ... SONAME` / `INSTALL PLUGIN` | `plugin_dir` is read-only and `/usr/lib/mysql/plugin` is `root:root 0755` while mariadbd runs as uid 999 — no way to place a `.so` |
+| `secure_file_priv` | `NULL`, i.e. **unrestricted**, so arbitrary file *write* as uid 999 is available — but nothing executes from the paths that uid can write |
+
+`wsrep_on` is `0` and the galera provider is not loaded. So a bypass alone is
+not obviously RCE here: an entry needs a bypass **plus** a code-execution
+primitive, or memory corruption that gets there directly.
+
+## 6. Status
+
+**No unauthenticated RCE found. No write primitive reachable pre-auth, and no
+authentication bypass.** Specifically:
+
+* every out-of-bounds access found (§4.2, §4.3) is a *read* that provably stays
+  inside the `net->buff` allocation on this target;
+* the two write-shaped bugs found (§4.8, and §4.5's stale cached pointer) both
+  need something an unauthenticated client cannot cause — a concurrent
+  `ALTER USER`, or an account with more than one authentication method;
+* the authentication decision logic (§4.7) is sound, with one latent gap that no
+  loaded plugin can reach.
 
 Done:
 * target pinned, configuration and account set read out of the running image ✔
 * pre-auth surface enumerated with the non-reachable parts positively excluded ✔
-* source audit of every reachable path (§4) ✔
+* source audit of every reachable path, including the TLS glue, the framing
+  layer and the auth decision logic (§4) ✔
 * ASAN build of 13.0.2 and targeted PoCs for §4.2 and §4.3 ✔
-* randomised fuzzing of the pre-auth fields against the ASAN build ✔ —
-  6000 cases (seed 1337) over capability-flag combinations, charset ids,
-  username/database/plugin-name shapes, all three auth-response length
-  encodings, malformed connection-attribute blobs, raw truncation at the 31/32
-  boundary, multi-packet bodies and auth-switch replies above
-  `net_buffer_length`. No sanitizer report, no crash, server up throughout.
+* 46,500 randomised pre-auth cases against the ASAN build ✔ — capability-flag
+  combinations, charset ids, username/database/plugin-name shapes, all three
+  auth-response length encodings, malformed connection-attribute blobs,
+  truncation at the 31/32 boundary, multi-packet bodies, auth-switch replies
+  above `net_buffer_length`, TLS-upgraded connections, desynchronised sequence
+  numbers and PROXY-protocol signatures. No sanitizer report, no crash.
 
-Next:
-* pin the OpenSSL 3.5.5 build in `ubuntu:resolute` and review it against known
-  issues, since §4.4 makes it reachable — this is where the remaining reachable
-  code volume is
-* extend fuzzing to the TLS side (records and handshake messages after the
-  upgrade), which the current harness only drives with well-formed TLS
-* re-pin `mariadb:latest` before any submission
-
-## 6. Tooling in this directory
+Remaining ideas, in order of expected value:
+* **In-process fuzzing.** Network fuzzing caps out around 50 cases/second, which
+  is far too slow for this parser. The leverage is a harness that drives
+  `parse_client_handshake_packet()` directly — there is no in-tree libFuzzer
+  target for the protocol, so it means constructing a THD and ACL state outside
+  `mysqld`, or adding a debug-only entry point to the ASAN build (acceptable for
+  discovery; any finding must then reproduce on the stock binary).
+* **Concurrency.** Everything so far was single-connection. The pre-auth path
+  touches shared state — `acl_cache->lock`, the host-error counters, the
+  password-error counters in §4.7 — and §4.8 is an index/lifetime bug that only
+  shows up under concurrent ACL change. Worth driving many simultaneous
+  pre-auth connections under ASAN with thread sanitiser as a second build.
+* **Re-pin `mariadb:latest` before any submission.**
+## 7. Tooling in this directory
 
 * `mariadb_preauth.py` — byte-level pre-auth protocol client. Exposes every
   handshake-response field independently, supports raw packet truncation,
@@ -374,7 +520,8 @@ Next:
   connection-attribute blobs and the auth-switch round trip. Run directly to
   dump a server's greeting and whether it advertises `CLIENT_SSL`.
 * `preauth_fuzz.py` — randomised driver over that harness with a liveness-based
-  crash detector.
+  crash detector. Covers plain and TLS-upgraded connections, desynchronised
+  packet sequence numbers and PROXY-protocol signatures.
 * `poc_post_tls_short_packet.py` — §4.2: TLS upgrade, then handshake responses
   shorter than 32 bytes.
 * `poc_next_field_boundary.py` — §4.3: packet lengths aligned to the allocator's

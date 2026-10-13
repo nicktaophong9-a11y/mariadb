@@ -106,6 +106,33 @@ class Conn:
     def send_raw(self, data):
         self.sock.sendall(data)
 
+    def start_tls(self, caps=None):
+        """Send a 32-byte SSLRequest and upgrade the socket to TLS.
+
+        The SSLRequest packet is just the fixed 32-byte prefix of a handshake
+        response; the real response is then sent inside the TLS session, which
+        is the packet parse_client_handshake_packet() re-reads after
+        sslaccept().
+        """
+        import ssl
+        if caps is None:
+            caps = (CLIENT_LONG_PASSWORD | CLIENT_PROTOCOL_41 |
+                    CLIENT_SECURE_CONNECTION | CLIENT_SSL)
+        req = (struct.pack("<I", caps & 0xffffffff) +
+               struct.pack("<I", 0x01000000) + bytes([45]) +
+               b"\x00" * 19 + struct.pack("<I", 0))
+        assert len(req) == 32
+        self.send_packet(req)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            ctx.set_ciphers("ALL:@SECLEVEL=0")
+        except ssl.SSLError:
+            pass
+        self.sock = ctx.wrap_socket(self.sock, do_handshake_on_connect=True)
+        return caps
+
     def read_packet(self):
         hdr = self._recv_exact(4)
         if hdr is None:

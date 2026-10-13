@@ -97,9 +97,22 @@ def one_case(host, port, rec):
         rec["error"] = f"connect: {exc}"
         return False
     try:
-        if c.read_greeting() is None:
+        g = c.read_greeting()
+        if g is None:
             rec["error"] = "no greeting"
             return False
+
+        # Roughly a third of the cases go through the TLS upgrade, which is the
+        # only way to reach the re-read after sslaccept() where the 32-byte
+        # minimum is not re-checked.
+        use_tls = (g["capabilities"] & CLIENT_SSL) and random.random() < 0.35
+        if use_tls:
+            try:
+                c.start_tls()
+            except Exception as exc:                        # noqa: BLE001
+                rec["error"] = f"tls: {exc}"
+                return True
+        rec["tls"] = use_tls
 
         caps = BASE_CAPS
         for bit in (CLIENT_CONNECT_WITH_DB, CLIENT_PLUGIN_AUTH,
@@ -134,15 +147,33 @@ def one_case(host, port, rec):
             plugin=random.choice(PLUGINS),
             attrs=make_attrs(),
             raw_tail=random.choice([None, b"", nonzero_bytes(random.randrange(1, 64))]),
-            truncate=random.choice([None, None, None, 31, 32, 33, 34, 30, 5, 2,
-                                    random.randrange(2, 120)]),
+            truncate=random.choice([None, None, None, 31, 32, 33, 34, 30, 6, 7,
+                                    5, 2, random.randrange(2, 120)]),
         )
         rec["caps"] = caps
         rec["pkt_len"] = len(pkt)
         rec["pkt"] = pkt.hex()
 
-        split = random.choice([None, None, None, 16, 64])
-        c.send_packet(pkt, split_at=split)
+        # A wrong sequence number sends my_real_read() down its
+        # packets_out_of_order path, which first offers the bytes to
+        # handle_proxy_header(); first bytes matching a PROXY signature take
+        # that further, up to the is_proxy_protocol_allowed() check.
+        seq = c.seq
+        roll = random.random()
+        if roll < 0.10:
+            seq = (c.seq + random.choice([1, 2, 255, 128])) & 0xff
+        rec["seq"] = seq
+        if roll > 0.96:
+            sig = random.choice([b"PROXY TCP4 1.2.3.4 5.6.7.8 1 2\r\n",
+                                 b"PROX",
+                                 b"\x0d\x0a\x00\x0d\x0a\x51\x55\x49\x54\x0a" +
+                                 b"\x21\x11\x00\x0c" + nonzero_bytes(12),
+                                 b"\x0d\x0a\x00\x0d"])
+            rec["proxy_sig"] = True
+            c.send_raw(sig)
+        else:
+            split = random.choice([None, None, None, 16, 64])
+            c.send_packet(pkt, seq=seq, split_at=split)
 
         # The server may answer with an auth-switch request. Replying with a
         # body larger than net_buffer_length (16k) forces net_realloc() while
