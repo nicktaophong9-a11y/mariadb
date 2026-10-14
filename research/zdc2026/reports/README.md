@@ -40,6 +40,12 @@ hardening, so they are ordinary MDEVs. 3 is not exploitable on any shipped
 configuration we could find, but it is in the auth decision, so it is routed
 privately rather than argued about in public.
 
+## Sending them
+
+[`submission.md`](submission.md) has the wrapper each channel wants: the cover
+email for the private disclosure of reports 1–3, and JIRA-ready summary,
+affects and description for reports 4 and 5.
+
 ## Affected versions
 
 Every finding was verified present in **11.8.4, 12.0.2, 13.0.2 and current
