@@ -1,0 +1,427 @@
+Research-build modifications against the mariadb-13.0.2 tag
+===========================================================
+
+Everything this audit changed in the source tree, in one place, so the state of
+the build that produced the findings is explicit and reversible. Apply with
+`patch -p1` from the top of a 13.0.2 tree; revert with `patch -R -p1`.
+
+It is a mix of three kinds of change, which should not be confused:
+
+1. INSTRUMENTATION, which must never ship.
+   - `preauth_fuzz_reparse()` and the `MARIADB_PREAUTH_FUZZ_HOOK` call site: an
+     in-process handshake re-parse loop, off unless MARIADB_FUZZ_HANDSHAKE=N
+     (NOTES 4.19, and 4.21 for what it does to fidelity).
+   - `preauth_poison_tail()` / `Preauth_tail_poison`: poisons the unused tail of
+     net->buff for the duration of a parse, which is what makes the over-reads
+     of report 1 visible at all -- they land inside a valid 16 KB allocation,
+     so ASAN cannot see them unaided (NOTES 4.24, 4.26).
+   - `preauth_stock_mode()`: MARIADB_PREAUTH_STOCK=1 turns off both the
+     poisoning and the report 1 fixes, so the binary behaves like the shipped
+     one while still under a sanitizer. This is how report 1's findings are
+     reproduced after the fixes are in (NOTES 4.32).
+
+2. THE PROPOSED FIXES, one per report:
+   - report 1: the `passwd` and `next_field` bounds, and the post-TLS
+     `pkt_len < 32` re-check. Gated behind preauth_stock_mode() so both states
+     are reachable from one binary.
+   - report 2: create_fromuni() builds the table through a local and publishes
+     cs->tab_from_uni last. NOT gated -- revert this hunk to reproduce.
+   - report 3: do_auth_once()'s `default:` sets res= CR_ERROR, and the
+     unknown-user guard compares `res <= CR_OK`. NOT gated.
+   - report 5: set_if_smaller() on the hostname-cache key length. NOT gated.
+
+   The second half of report 2's patch -- the release/acquire on MY_CS_READY --
+   is NOT here; it is described in the report and was not exercised.
+
+3. A BUILD WORKAROUND: sql/CMakeLists.txt excludes vector_mhnsw.cc from
+   -fsanitize=thread, without which the server segfaults in the dynamic loader
+   (report 4). Needed to build TSAN at all.
+
+--- a/sql/sql_acl.cc
++++ b/sql/sql_acl.cc
+@@ -60,6 +60,14 @@
+ #include "sql_plugin_compat.h"
+ #include "wsrep_mysqld.h"
+ 
++/*
++  Research build only: enables the env-gated in-process handshake re-parse
++  harness further down this file (preauth_fuzz_reparse). It does nothing unless
++  MARIADB_FUZZ_HANDSHAKE is set in the environment, and it must never be
++  present in a shipped build.
++*/
++#define MARIADB_PREAUTH_FUZZ_HOOK 1
++
+ #define MAX_SCRAMBLE_LENGTH 1024
+ 
+ bool using_global_priv_table= true;
+@@ -14419,6 +14427,78 @@
+ 
+ 
+ /* the packet format is described in send_client_reply_packet() */
++/*
++  Research build only. MARIADB_PREAUTH_STOCK=1 turns off both the fixes applied
++  below and the tail poisoning, so the build behaves like the shipped binary
++  while still running under ASAN. That is what is needed to show whether a bug
++  is reachable in the real allocator's behaviour rather than in the
++  instrumentation's.
++*/
++static my_bool preauth_stock_mode(void)
++{
++  static int probed= 0, stock= 0;
++  if (!probed)
++  {
++    const char *e= getenv("MARIADB_PREAUTH_STOCK");
++    stock= e && *e && *e != '0';
++    probed= 1;
++  }
++  return (my_bool) stock;
++}
++
++/*
++  Research build only.
++
++  NOTES 4.2 and 4.3 are reads that leave the packet body but stay inside the
++  net->buff allocation, which is exactly why ASAN cannot see them: the slack
++  between the end of the packet and net->buff_end is addressable memory. For
++  the duration of each re-parse the slack is poisoned, so a read past the
++  packet is reported instead of landing silently in the same allocation.
++
++  This is only safe inside the hook, where the loop has cleared CLIENT_SSL and
++  CLIENT_PLUGIN_AUTH out of the packet: the parser therefore performs no
++  network I/O, so nothing legitimately writes into the poisoned slack. Poisoning
++  around the *network* parse would false-positive on the auth-switch branch,
++  which calls my_net_read() from inside parse_client_handshake_packet().
++*/
++#ifdef __SANITIZE_ADDRESS__
++#include <sanitizer/asan_interface.h>
++static inline void preauth_poison_tail(NET *net, ulong len)
++{
++  uchar *from= net->read_pos + len + 1;  /* +1: the terminator my_net_read sets */
++  /* ASAN poisons whole 8-byte granules; round up so nothing real is covered */
++  from= (uchar*) (((uintptr_t) from + 7) & ~(uintptr_t) 7);
++  if (net->buff_end > from)
++    __asan_poison_memory_region(from, (size_t) (net->buff_end - from));
++}
++static inline void preauth_unpoison_buffer(NET *net)
++{
++  if (net->buff && net->buff_end > net->buff)
++    __asan_unpoison_memory_region(net->buff,
++                                  (size_t) (net->buff_end - net->buff));
++}
++#else
++static inline void preauth_poison_tail(NET *, ulong) {}
++static inline void preauth_unpoison_buffer(NET *) {}
++#endif
++
++/*
++  Research build only. Scope guard so the *network* parse gets the same tail
++  poisoning the hook has, without sprinkling unpoison calls over the ~20 return
++  paths of parse_client_handshake_packet(): the destructor lifts it on every
++  exit. lift() is for the nested network I/O inside the parse, which writes into
++  net->buff legitimately (read and write share the buffer).
++*/
++class Preauth_tail_poison
++{
++  NET *m_net;
++public:
++  Preauth_tail_poison(NET *net, ulong len) : m_net(net)
++  { if (!preauth_stock_mode()) preauth_poison_tail(net, len); }
++  void lift() { preauth_unpoison_buffer(m_net); }
++  ~Preauth_tail_poison() { preauth_unpoison_buffer(m_net); }
++};
++
+ static ulong parse_client_handshake_packet(MPVIO_EXT *mpvio,
+                                            uchar **buff, ulong pkt_len)
+ {
+@@ -14480,6 +14560,20 @@
+ 
+     DBUG_PRINT("info", ("Reading user information over SSL layer"));
+     pkt_len= my_net_read(net);
++#ifdef MARIADB_PREAUTH_FUZZ_HOOK
++    /*
++      Research build only: NOTES 4.2's fix. client_capabilities came from the
++      pre-TLS packet and still says CLIENT_PROTOCOL_41, but pkt_len has been
++      replaced by this read's length and is only checked against
++      NORMAL_HANDSHAKE_SIZE (6), so the second CLIENT_PROTOCOL_41 block reads
++      read_pos[4..8] out of a packet that may be 6 bytes long. Mirrors the
++      pkt_len < 32 check the first read already has.
++    */
++    if (!preauth_stock_mode() &&
++        (client_capabilities & CLIENT_PROTOCOL_41) && pkt_len != packet_error &&
++        pkt_len < 32)
++      return packet_error;
++#endif
+     if (unlikely(pkt_len == packet_error || pkt_len < NORMAL_HANDSHAKE_SIZE))
+     {
+       DBUG_PRINT("error", ("Failed to read user information (pkt_len= %lu)",
+@@ -14504,6 +14598,13 @@
+     return packet_error;
+   }
+ 
++  /*
++    pkt_len is final here for both the plain and the post-TLS path, so the tail
++    poisoning covers the whole rest of the parse -- including the post-TLS
++    re-read branch, which the hook can never reach because it clears CLIENT_SSL.
++  */
++  Preauth_tail_poison tail_poison(net, pkt_len);
++
+   if (client_capabilities & CLIENT_PROTOCOL_41)
+   {
+     thd->max_client_packet_length= uint4korr(net->read_pos+4);
+@@ -14537,6 +14638,15 @@
+ 
+   char *user= end;
+   char *passwd= strend(user)+1;
++#ifdef MARIADB_PREAUTH_FUZZ_HOOK
++  /*
++    Research build only: the fix proposed for NOTES 4.25, applied here so the
++    poisoned campaign can get past the four known over-read sites and look for
++    the next one. Remove to reproduce 4.25.
++  */
++  if (!preauth_stock_mode() && passwd > (char*) net->read_pos + pkt_len)
++    return packet_error;
++#endif
+   size_t user_len= (size_t)(passwd - user - 1), db_len;
+   char *db= passwd;
+   char user_buff[USERNAME_LENGTH + 1];	// buffer to store user in utf8
+@@ -14587,6 +14697,12 @@
+   db_len= safe_strlen(db);
+ 
+   char *next_field= passwd + passwd_len + (db ? db_len + 1 : 0);
++#ifdef MARIADB_PREAUTH_FUZZ_HOOK
++  /* NOTES 4.25, fourth branch: the check that already exists further down,
++     hoisted above the scan that needs it. Research build only. */
++  if (!preauth_stock_mode() && next_field > (char*) net->read_pos + pkt_len)
++    return packet_error;
++#endif
+   Lex_ident_plugin client_plugin= Lex_cstring_strlen(next_field);
+ 
+   /*
+@@ -14705,6 +14821,8 @@
+   if (client_auth_plugin &&
+       !client_plugin.streq(Lex_cstring_strlen(client_auth_plugin)))
+   {
++    /* the auth-switch round trip writes and reads net->buff for real */
++    tail_poison.lift();
+     mpvio->cached_client_reply.plugin= client_plugin;
+     if (send_plugin_request_packet(mpvio,
+                                    (uchar*) mpvio->cached_server_packet.pkt,
+@@ -14767,6 +14885,122 @@
+   a client authentication handshake packet, and handles plugin negotiation
+   with the client, if necessary.
+ */
++#ifdef MARIADB_PREAUTH_FUZZ_HOOK
++/*
++  Discovery-only harness. This is NOT part of the server: it is behind a build
++  macro and an environment variable, and must never be in a build that is not
++  an instrumented one used for bug hunting.
++
++  Network fuzzing of the handshake is bounded by TCP connection setup, around
++  fifty cases a second. Measured coverage showed the reachable pre-auth code is
++  already almost fully traversed, so what is missing is not coverage but the
++  number of distinct inputs per covered branch. This re-runs
++  parse_client_handshake_packet() over mutated copies of the packet the client
++  actually sent, against the real THD, NET and ACL state, so one connection
++  yields thousands of parses.
++
++  Two capability bits are cleared from every mutated packet because their
++  branches perform network I/O from inside the loop and would block:
++  CLIENT_SSL calls sslaccept(), and CLIENT_PLUGIN_AUTH is what lets the parser
++  reach the auth-switch branch that calls my_net_read(). Both are exercised
++  over the network instead (see poc_coverage_gaps.py).
++
++  Anything that crashes here must be reproduced over the network against an
++  unmodified binary before it counts as a finding.
++*/
++
++static void preauth_fuzz_reparse(MPVIO_EXT *mpvio, ulong pkt_len)
++{
++  static int probed= 0;
++  static ulong iterations= 0;
++  if (!probed)
++  {
++    probed= 1;
++    const char *e= getenv("MARIADB_FUZZ_HANDSHAKE");
++    iterations= e ? strtoul(e, NULL, 10) : 0;
++  }
++  if (!iterations || pkt_len < MIN_HANDSHAKE_SIZE || pkt_len > 8192)
++    return;
++
++  THD *thd= mpvio->auth_info.thd;
++  NET *net= &thd->net;
++
++  uchar *orig= (uchar*) my_malloc(PSI_NOT_INSTRUMENTED, pkt_len + 1, MYF(0));
++  if (!orig)
++    return;
++  memcpy(orig, net->read_pos, pkt_len + 1);
++
++  const ulonglong saved_caps= thd->client_capabilities;
++  ACL_USER *const saved_acl_user= mpvio->acl_user;
++  const uint saved_curr_auth= mpvio->curr_auth;
++  ulong seed= (ulong) thd->thread_id * 2654435761UL + (ulong) pkt_len + 1;
++
++  for (ulong i= 0; i < iterations; i++)
++  {
++    ulong len= pkt_len;
++    preauth_unpoison_buffer(net);       /* our own memcpy must not trip it */
++    memcpy(net->read_pos, orig, pkt_len + 1);
++
++    uint nmut= 1 + (uint) (seed % 8);
++    for (uint m= 0; m < nmut; m++)
++    {
++      seed= seed * 1103515245UL + 12345UL;
++      ulong off= (seed >> 8) % pkt_len;
++      seed= seed * 1103515245UL + 12345UL;
++      net->read_pos[off]= (uchar) (seed >> 16);
++    }
++
++    /* sometimes shorten the packet, preserving the terminator that
++       my_net_read() guarantees at read_pos[len] */
++    seed= seed * 1103515245UL + 12345UL;
++    if ((seed >> 7) & 1)
++    {
++      len= MIN_HANDSHAKE_SIZE +
++           ((seed >> 9) % (pkt_len - MIN_HANDSHAKE_SIZE + 1));
++      net->read_pos[len]= 0;
++    }
++
++    net->read_pos[1]&= (uchar) ~((CLIENT_SSL >> 8) & 0xff);
++    net->read_pos[2]&= (uchar) ~((CLIENT_PLUGIN_AUTH >> 16) & 0xff);
++    /*
++      NOTES 4.3 -- the out-of-packet strlen() in the !CLIENT_SECURE_CONNECTION
++      branch -- is a known and recorded read, and under the tail poisoning it
++      halts the server on the first mutated packet that reaches it. Keeping the
++      bit set lets the poisoned run explore the rest of the parser instead of
++      stopping on something already written up. That branch is still exercised
++      over the network, where the poisoning is not in effect.
++    */
++    net->read_pos[1]|= (uchar) ((CLIENT_SECURE_CONNECTION >> 8) & 0xff);
++
++    thd->client_capabilities= saved_caps;
++    mpvio->acl_user= NULL;
++    mpvio->curr_auth= 0;
++    mpvio->status= MPVIO_EXT::FAILURE;
++    mpvio->cached_client_reply.pkt= 0;
++    mpvio->cached_client_reply.pkt_len= 0;
++    mpvio->cached_client_reply.plugin= ""_LEX_CSTRING;
++
++    uchar *sink= NULL;
++    preauth_poison_tail(net, len);      /* any read past the body now reports */
++    (void) parse_client_handshake_packet(mpvio, &sink, len);
++    thd->clear_error();
++  }
++
++  preauth_unpoison_buffer(net);
++  memcpy(net->read_pos, orig, pkt_len + 1);
++  my_free(orig);
++  thd->client_capabilities= saved_caps;
++  mpvio->acl_user= saved_acl_user;
++  mpvio->curr_auth= saved_curr_auth;
++  mpvio->status= MPVIO_EXT::FAILURE;
++  mpvio->cached_client_reply.pkt= 0;
++  mpvio->cached_client_reply.pkt_len= 0;
++  mpvio->cached_client_reply.plugin= ""_LEX_CSTRING;
++  thd->clear_error();
++}
++#endif /* MARIADB_PREAUTH_FUZZ_HOOK */
++
++
+ static int server_mpvio_read_packet(MYSQL_PLUGIN_VIO *param, uchar **buf)
+ {
+   MPVIO_EXT * const mpvio= (MPVIO_EXT *) param;
+@@ -14828,6 +15062,9 @@
+   */
+   if (mpvio->packets_read == 1)
+   {
++#ifdef MARIADB_PREAUTH_FUZZ_HOOK
++    preauth_fuzz_reparse(mpvio, pkt_len);
++#endif
+     pkt_len= parse_client_handshake_packet(mpvio, buf, pkt_len);
+     if (unlikely(pkt_len == packet_error))
+       goto err;
+@@ -15030,7 +15267,12 @@
+         compat.upgrade(&mpvio->auth_info);
+       }
+       break;
+-    default: DBUG_ASSERT(0);
++    default:
++      /* Report 03A: an unexpected interface version must not inherit the
++         CR_OK that res was initialised with. */
++      DBUG_ASSERT(0);
++      res= CR_ERROR;
++      break;
+     }
+ 
+     if (unlock_plugin)
+@@ -15175,7 +15417,9 @@
+     }
+   }
+ 
+-  if (mpvio.make_it_fail && res == CR_OK)
++  /* Report 03B: res <= CR_OK, so CR_OK_HANDSHAKE_COMPLETE (-2) cannot slip
++     past the guard that exists to fail unknown users. */
++  if (mpvio.make_it_fail && res <= CR_OK)
+   {
+     mpvio.status= MPVIO_EXT::FAILURE;
+     res= CR_ERROR;
+--- a/strings/ctype-simple.c
++++ b/strings/ctype-simple.c
+@@ -1455,15 +1455,23 @@
+   
+   /* Allocate and fill reverse table for each plane */
+   n=i;
+-  if (!(cs->tab_from_uni= (MY_UNI_IDX *)
+-                          (loader->once_alloc)(sizeof(MY_UNI_IDX) * (n + 1))))
++  /*
++    Report 02: build the table through a local and publish cs->tab_from_uni
++    only once it is complete, including the end-of-list marker. Publishing the
++    pointer first leaves a window in which my_wc_mb_8bit() can walk entries
++    that have not been written and past a terminator that is not there yet.
++  */
++  MY_UNI_IDX *tab_from_uni= (MY_UNI_IDX *)
++                            (loader->once_alloc)(sizeof(MY_UNI_IDX) * (n + 1));
++  if (!tab_from_uni)
+     return TRUE;
+ 
+   for (i=0; i< n; i++)
+-    ((struct my_uni_idx_st*)cs->tab_from_uni)[i]= idx[i].uidx;
+-  
++    ((struct my_uni_idx_st*)tab_from_uni)[i]= idx[i].uidx;
++
+   /* Set end-of-list marker */
+-  bzero((char*) &cs->tab_from_uni[i],sizeof(MY_UNI_IDX));
++  bzero((char*) &tab_from_uni[i],sizeof(MY_UNI_IDX));
++  cs->tab_from_uni= tab_from_uni;
+   return FALSE;
+ }
+ 
+--- a/sql/hostname.cc
++++ b/sql/hostname.cc
+@@ -180,6 +180,8 @@
+ {
+   size_t ip_string_length= strlen(ip_string);
+   DBUG_ASSERT(ip_string_length < HOST_ENTRY_KEY_SIZE);
++  /* Report 05A: in a release build the assertion above is the only bound. */
++  set_if_smaller(ip_string_length, HOST_ENTRY_KEY_SIZE - 1);
+ 
+   memset(ip_key, 0, HOST_ENTRY_KEY_SIZE);
+   memcpy(ip_key, ip_string, ip_string_length);
+--- a/sql/CMakeLists.txt
++++ b/sql/CMakeLists.txt
+@@ -246,6 +246,16 @@
+ STATIC_ONLY NOT_EMBEDDED)
+ 
+ 
++# Research build only: GCC emits an ifunc resolver for the function-multiversioned
++# FVector helpers in vector_mhnsw.cc (see the target() macros in bloom_filters.h).
++# Under -fsanitize=thread the resolver itself is instrumented, and it runs from
++# the dynamic loader before __tsan_init, so mariadbd segfaults during relocation
++# before it can print anything. Exclude just this file; the vector/HNSW code is
++# post-auth and outside the pre-auth scope this build exists for.
++IF(WITH_TSAN)
++  SET_SOURCE_FILES_PROPERTIES(vector_mhnsw.cc PROPERTIES COMPILE_OPTIONS "-fno-sanitize=thread")
++ENDIF()
++
+ ADD_LIBRARY(sql STATIC ${SQL_SOURCE})
+ MAYBE_DISABLE_IPO(sql)
+ DTRACE_INSTRUMENT(sql)

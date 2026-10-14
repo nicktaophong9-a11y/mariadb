@@ -65,6 +65,19 @@ parse (`../NOTES.md` §4.24, §4.26); the same instrumentation is what makes the
 reproducible. Report 2 came from a ThreadSanitizer build, which needs the fix
 in report 4 before it will start at all.
 
+## The research build
+
+[`research-build.patch`](research-build.patch) is everything this audit changed
+in the source tree, against the `mariadb-13.0.2` tag, with a header separating
+the three kinds of change: instrumentation that must never ship, the proposed
+fixes one per report, and the one build workaround. Apply with `patch -p1`,
+revert with `patch -R -p1`.
+
+It matters for reproduction because the fixes are now *in* that tree. Report 1's
+are gated behind `MARIADB_PREAUTH_STOCK=1`, so one binary reproduces both
+states; reports 2, 3 and 5's are not gated, so reproducing those findings means
+reverting their hunks.
+
 ## Reproduction harness
 
 `../mariadb_preauth.py` speaks the handshake at byte level; the `poc_*.py`
