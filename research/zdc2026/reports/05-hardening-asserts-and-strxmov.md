@@ -64,7 +64,7 @@ server, so this is robustness rather than a vulnerability. It is also only
 entered for a charset that is neither compiled in nor already loaded, and on a
 normal build every charset `Index.xml` declares is compiled in, so the branch is
 effectively dead. Still an unbounded string concatenation into a fixed buffer:
-`strnxmov(buf, sizeof(buf), ...)` or an `my_snprintf()` would remove the
+`strxnmov(buf, sizeof(buf), ...)` (declared in `include/m_string.h`) or an `my_snprintf()` would remove the
 question.
 
 ## A note on telling these apart

@@ -1,8 +1,16 @@
 # Upstream reports
 
 Five reports drawn from the pre-auth audit in `../NOTES.md`. Each is
-self-contained: impact, reproduction, root cause, and a patch that was applied
-and re-tested against the PoC before being written down.
+self-contained: impact, reproduction, root cause and a proposed patch.
+
+**Which patches were actually tested.** Report 1's three checks were applied to
+a research build and the PoCs re-run against them: all four branches of its
+finding A/B go silent at packet lengths 511, 512 and 16384, and
+`poc_post_tls_short_packet.py` goes clean. Report 4's CMake workaround was
+applied and is what made the TSAN server start. The patches in reports 2, 3 and
+5 are proposals written from reading the code — they compile-check by eye
+against the helpers they use, but they were **not** applied or tested, and are
+offered as a starting point rather than a submission.
 
 | # | report | class | where to send |
 |---|---|---|---|
