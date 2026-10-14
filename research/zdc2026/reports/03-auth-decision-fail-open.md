@@ -112,6 +112,23 @@ server plugin where it arrives:
        break;
 ```
 
+## Regression test
+
+Both patches change the authentication decision, so the matrix that matters is
+whether it still decides correctly. With 3A and 3B applied:
+
+| attempt | result |
+|---|---|
+| `root` + correct password | granted as `root@localhost` |
+| `root` + wrong password | refused, `ER_ACCESS_DENIED_ERROR` |
+| `root` + empty password | refused |
+| unknown user + password | refused |
+| unknown user + **empty** password | refused — this is the `make_it_fail` path 3B touches |
+| `mariadb.sys` + empty password | refused, "this account is locked" |
+
+and 15,000 randomised pre-auth cases plus the targeted PoC groups run clean
+afterwards.
+
 ## Why both are worth changing anyway
 
 The decision site needs `res` to mean "the plugin said yes". Both findings are

@@ -179,6 +179,21 @@ and the double-checked lock needs the ordering it is relying on: a release
 store of `cs->state |= MY_CS_READY` under the mutex with an acquire load on the
 fast path.
 
+### What testing the first half showed
+
+Applied to a research build, the raced write in the ThreadSanitizer report
+moves from `ctype-simple.c:1458` — the allocation line, publishing a table with
+no entries and no terminator — to `:1474`, the single `cs->tab_from_uni=
+tab_from_uni;` at the end. So after the patch a reader observes either the old
+value or a complete table, which is the property that matters.
+
+ThreadSanitizer still reports the pair, and that is expected: it reports the
+absence of a happens-before edge, not inconsistent data, and a plain store
+racing a plain load has no such edge however complete the table is. Closing
+that is the second half of the patch. We exercised the first half only.
+
+### The sibling sites
+
 The same publish-then-fill shape appears twice more, both reached through the
 same lazy init, and both worth the same treatment even though their readers are
 weaker (pre-auth they are reached with `system_charset_info` rather than an

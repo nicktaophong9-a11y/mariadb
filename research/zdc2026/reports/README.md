@@ -3,14 +3,27 @@
 Five reports drawn from the pre-auth audit in `../NOTES.md`. Each is
 self-contained: impact, reproduction, root cause and a proposed patch.
 
-**Which patches were actually tested.** Report 1's three checks were applied to
-a research build and the PoCs re-run against them: all four branches of its
-finding A/B go silent at packet lengths 511, 512 and 16384, and
-`poc_post_tls_short_packet.py` goes clean. Report 4's CMake workaround was
-applied and is what made the TSAN server start. The patches in reports 2, 3 and
-5 are proposals written from reading the code — they compile-check by eye
-against the helpers they use, but they were **not** applied or tested, and are
-offered as a starting point rather than a submission.
+**Every patch here was applied to a research build and tested.** What each
+test showed:
+
+* **Report 1** — all four branches of finding A/B go silent at packet lengths
+  511, 512 and 16384, and `poc_post_tls_short_packet.py` goes clean.
+* **Report 2** — the raced write moves from `ctype-simple.c:1458` (publishing an
+  empty table) to `:1474` (publishing a complete one), so a reader can no longer
+  observe a partially built array. ThreadSanitizer still reports the pair,
+  because the patch closes the *window* without adding synchronisation; that is
+  what the second half of the patch, the release/acquire on `MY_CS_READY`, is
+  for. Both halves are in the report and only the first was exercised.
+* **Report 3** — the auth decision still behaves: correct password granted,
+  wrong password refused, empty password refused, unknown user refused, unknown
+  user with an empty password refused (the `make_it_fail` path the patch
+  touches), and `mariadb.sys` still refused by the `account_locked` check.
+* **Report 4** — the workaround is what made the TSAN server start at all.
+* **Report 5** — no behaviour change observed.
+
+With all of them in, 15,000 randomised pre-auth cases, the four targeted PoC
+groups, the post-TLS shapes and the collation race run clean with no sanitizer
+report and the server alive.
 
 | # | report | class | where to send |
 |---|---|---|---|
