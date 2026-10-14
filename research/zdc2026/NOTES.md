@@ -2878,7 +2878,19 @@ What is still outstanding, in order of expected value:
   set the way writes and indirect calls were. §4.24/§4.25 attacked them with
   instrumentation rather than enumeration, which found a bug but does not
   bound the class.
-* **Re-pin `mariadb:latest` before any submission.**
+* ~~**Re-pin `mariadb:latest` before any submission.**~~ **Checked 2026-10-14:
+  still 13.0.2.** `latest`, `13.0.2`, `13.0` and `13` all carry the same index
+  digest `sha256:f1bba652ba57bea3099ca2fe1af692af537c27d96e0bcde39dce29e2ba1ec4f3`,
+  last updated 2026-10-02 — i.e. the tag has not moved since before this audit
+  began, and the amd64 manifest pinned in §1 is still what `latest` resolves to.
+  13.1.1 exists on Docker Hub only as `-rc` tags (eight of them, no non-rc 13.1
+  tag at all), so `latest` will not follow it until GA. Nothing in the pre-auth
+  path is newer than what was audited.
+
+  (Read from `hub.docker.com/v2/repositories/library/mariadb/tags`; the registry
+  manifest endpoint was returning HTTP 429 with
+  `x-ratelimit-remaining: 0;w=3600` for unauthenticated pulls from this egress
+  address, the same limit §7 records hitting at session start.)
 
 ## 7. Tooling in this directory
 
